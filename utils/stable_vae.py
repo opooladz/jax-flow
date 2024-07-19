@@ -17,13 +17,17 @@ class StableVAE:
     module: FlaxAutoencoderKL = struct.field(pytree_node=False)
 
     @classmethod
-    def create(cls) -> "VAE":
-        # module, params = FlaxAutoencoderKL.from_pretrained(
-        #     "stabilityai/stable-diffusion-xl-base-1.0", subfolder="vae"
-        # )
-        module, params = FlaxAutoencoderKL.from_pretrained(
-            "pcuenq/sd-vae-ft-mse-flax"
-        )
+    def create(cls, vae_type='sd') -> "VAE":
+        if vae_type == 'sd':
+            module, params = FlaxAutoencoderKL.from_pretrained(
+                "pcuenq/sd-vae-ft-mse-flax"
+            )
+        elif vae_type == 'sdxl':
+            module, params = FlaxAutoencoderKL.from_pretrained(
+                "stabilityai/stable-diffusion-xl-base-1.0", subfolder="vae"
+            )
+        else:
+            raise ValueError(f"Unknown VAE type: {vae_type}")
         params = jax.device_get(params)
         return cls(
             params=params,

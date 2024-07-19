@@ -111,6 +111,11 @@ config_flags.DEFINE_config_dict('model', model_config, lock_config=False)
 ## Model Definitions.
 ##############################################
 
+# Makes rng unique over a given axis.
+def fold_rng_over_axis(rng, axis_name):
+    axis_index = jax.lax.axis_index(axis_name)
+    return jax.random.fold_in(rng, axis_index)
+
 # x_0 = Noise
 # x_1 = Data
 def get_x_t(images, eps, t):
@@ -296,6 +301,9 @@ def main(_):
     rng = jax.random.PRNGKey(FLAGS.seed)
     rng, param_key, dropout_key = jax.random.split(rng, 3)
     print("Total Memory on device:", float(jax.local_devices()[0].memory_stats()['bytes_limit']) / 1024**3, "GB")
+    def print_memory(label):
+        print(f"[{label}]Total Used on device:", float(jax.local_devices()[0].memory_stats()['bytes_in_use']) / 1024**3, "GB")
+    print_memory('init')
 
     ###################################
     # Creating Model and put on devices.
@@ -317,6 +325,9 @@ def main(_):
     example_label = jnp.zeros((1,), dtype=jnp.int32)
     model_rngs = {'params': param_key, 'label_dropout': dropout_key}
     params = model_def.init(model_rngs, example_obs, example_t, example_label)['params']
+
+    print(model_def.tabulate(model_rngs, example_obs, example_t, example_label))
+
     print("Total num of parameters:", sum(x.size for x in jax.tree_util.tree_leaves(params)))
     tx = optax.adam(learning_rate=FLAGS.model['lr'], b1=FLAGS.model['beta1'], b2=FLAGS.model['beta2'])
     model_ts = TrainState.create(model_def, params, tx=tx)
@@ -338,6 +349,8 @@ def main(_):
     model = model.replace(rng=jax.random.split(rng, len(jax.local_devices())))
     jax.debug.visualize_array_sharding(model.model.params['FinalLayer_0']['Dense_0']['bias'])
 
+    print_memory('model params')
+
     valid_images_small, valid_labels_small = next(dataset_valid)
     valid_images_small = valid_images_small[:device_count, None]
     valid_labels_small = valid_labels_small[:device_count, None]
@@ -346,6 +359,8 @@ def main(_):
     imagenet_labels = open('data/imagenet_labels.txt').read().splitlines()
     if FLAGS.model.use_stable_vae:
         valid_images_small = vae_encode_pmap(vae_rng, valid_images_small)
+
+    print_memory('valid batch')
 
     ###################################
     # Train Loop
@@ -467,8 +482,8 @@ def main(_):
         # Denoising at different numbers of steps.
         key = jax.random.PRNGKey(42 + jax.process_index() + i)
         eps = jax.random.normal(key, valid_images_small.shape) # [devices, batch//devices, etc..]
-        delta_t = 1.0 / FLAGS.model.denoise_timesteps
         for denoise_timesteps in [1, 4, 32]:
+            delta_t = 1.0 / denoise_timesteps
             x = eps
             all_x = []
             for ti in range(denoise_timesteps):

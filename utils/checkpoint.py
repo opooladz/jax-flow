@@ -17,6 +17,8 @@ def name(filename):
 
 class Checkpoint:
     def __init__(self, filename, parallel=True):
+        if 'gs://rll' in filename:
+            filename = filename.replace('gs://rll', 'gs://rll-tpus-kvfrans')
         self._filename = filename
         self._values = {}
         self._parallel = parallel
@@ -38,12 +40,6 @@ class Checkpoint:
             return self._values[name]
         except AttributeError:
             raise ValueError(name)
-        
-    def set_model(self, model):
-        for key in model.__dict__.keys():
-            data = getattr(model, key)
-            if hasattr(data, 'save') or key == 'config':
-                self._values[key] = getattr(model, key)
 
     def save(self, filename=None, keys=None):
         assert self._filename or filename
@@ -87,11 +83,3 @@ class Checkpoint:
         age = time.time() - data['_timestamp']
         print(f'Loaded checkpoint from {age:.0f} seconds ago.')
         return data
-    
-    def load_model(self, model, filename=None):
-        cp_dict = self.load_as_dict()
-        replace_dict = {}
-        for key in model.__dict__.keys():
-            if key in cp_dict and key != 'config':
-                replace_dict[key] = getattr(model, key).load(cp_dict[key])
-        return model.replace(**replace_dict)

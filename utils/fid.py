@@ -30,8 +30,8 @@ def get_fid_network():
     model = InceptionV3(pretrained=True)
     rng = jax.random.PRNGKey(0)
     params = model.init(rng, jnp.ones((1, 256, 256, 3)))
-    params = flax.jax_utils.replicate(params, devices=jax.local_devices())
-    apply_fn = jax.pmap(functools.partial(model.apply, train=False))
+    # params = flax.jax_utils.replicate(params, devices=jax.local_devices())
+    apply_fn = jax.jit(functools.partial(model.apply, train=False))
     apply_fn = functools.partial(apply_fn, params)
     return apply_fn
 
