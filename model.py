@@ -1,14 +1,8 @@
-# https://github.com/yiyixuxu/denoising-diffusion-flax/blob/main/denoising_diffusion_flax/unet.py
-
-import functools
 import math
-from typing import Any, Tuple
+from typing import Any, Callable, Optional, Tuple, Type, Sequence, Union
 import flax.linen as nn
-from flax.linen.initializers import xavier_uniform
 import jax
-from jax import lax
 import jax.numpy as jnp
-import ml_collections
 from einops import rearrange
 
 Array = Any
@@ -16,9 +10,10 @@ PRNGKey = Any
 Shape = Tuple[int]
 Dtype = Any
 
-from typing import Any, Callable, Optional, Tuple, Type, Sequence, Union
+from utils.spectral_optimizer import spectral_init, scale_spectral_norm
 
-# Port of https://github.com/facebookresearch/DiT/blob/main/models.py into jax.
+
+# Based on https://github.com/facebookresearch/DiT/blob/main/models.py 
 
 #################################################################################
 #               Embedding Layers for Timesteps and Class Labels                 #
@@ -27,42 +22,61 @@ from typing import Any, Callable, Optional, Tuple, Type, Sequence, Union
 def fourier_features(rng, num_channels):
     return 2 * jnp.pi * jax.random.normal(rng, (num_channels,))
 
-class MPFourier(nn.Module):
-    """
-    Embeds scalar timesteps into vector representations via random fourier features.
-    """
-    dtype: Dtype = jnp.float32
-    num_channels: int = 256
-    hidden_size: int = 256
+# From https://github.com/young-geng/m3ae_public/blob/master/m3ae/model.py
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+    assert embed_dim % 2 == 0
+    omega = jnp.arange(embed_dim // 2, dtype=jnp.float32)
+    omega /= embed_dim / 2.
+    omega = 1. / 10000**omega  # (D/2,)
 
-    @nn.compact
-    def __call__(self, t):
-        freqs = self.param("freqs", fourier_features, self.num_channels)
-        phases = self.param("phases", fourier_features, self.num_channels)
-        freqs = jax.lax.stop_gradient(freqs)
-        phases = jax.lax.stop_gradient(phases)
-        x = jnp.outer(t, freqs) + phases
-        x = jnp.cos(x) * jnp.sqrt(2.0)
+    pos = pos.reshape(-1)  # (M,)
+    out = jnp.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
 
-        x = nn.Dense(self.hidden_size, kernel_init=nn.initializers.normal(0.02), dtype=self.dtype)(x)
-        x = nn.silu(x)
-        x = nn.Dense(self.hidden_size, kernel_init=nn.initializers.normal(0.02), dtype=self.dtype)(x)
-        return x
+    emb_sin = jnp.sin(out) # (M, D/2)
+    emb_cos = jnp.cos(out) # (M, D/2)
+
+    emb = jnp.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
+    return emb
+
+def get_1d_sincos_pos_embed(embed_dim, length):
+    emb = get_1d_sincos_pos_embed_from_grid(embed_dim, jnp.arange(length, dtype=jnp.float32))
+    return jnp.expand_dims(emb,0)
+
+def get_2d_sincos_pos_embed(rng, embed_dim, length):
+    # example: embed_dim = 256, length = 16*16
+    grid_size = int(length ** 0.5)
+    assert grid_size * grid_size == length
+    def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
+        assert embed_dim % 2 == 0
+        # use half of dimensions to encode grid_h
+        emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
+        emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
+        emb = jnp.concatenate([emb_h, emb_w], axis=1) # (H*W, D)
+        return emb
+
+    grid_h = jnp.arange(grid_size, dtype=jnp.float32)
+    grid_w = jnp.arange(grid_size, dtype=jnp.float32)
+    grid = jnp.meshgrid(grid_w, grid_h)  # here w goes first
+    grid = jnp.stack(grid, axis=0)
+    grid = grid.reshape([2, 1, grid_size, grid_size])
+    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
+    return jnp.expand_dims(pos_embed, 0) # (1, H*W, D)
 
 class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
     """
     hidden_size: int
+    kernel_init: Callable
     dtype: Dtype
     frequency_embedding_size: int = 256
 
     @nn.compact
     def __call__(self, t):
         x = self.timestep_embedding(t)
-        x = nn.Dense(self.hidden_size, kernel_init=nn.initializers.normal(0.02), dtype=self.dtype)(x)
+        x = nn.Dense(self.hidden_size, kernel_init=self.kernel_init(), dtype=self.dtype)(x)
         x = nn.silu(x)
-        x = nn.Dense(self.hidden_size, kernel_init=nn.initializers.normal(0.02), dtype=self.dtype)(x)
+        x = nn.Dense(self.hidden_size, kernel_init=self.kernel_init(), dtype=self.dtype)(x)
         return x
 
     # t is between [0, 1].
@@ -109,48 +123,20 @@ class LabelEmbedder(nn.Module):
     
     @nn.compact
     def __call__(self, labels, train, force_drop_ids=None):
-        embedding_table = nn.Embed(self.num_classes + 1, self.hidden_size, embedding_init=nn.initializers.normal(0.02), dtype=self.dtype)
+        embedding_table = nn.Embed(self.num_classes + 1, self.hidden_size, 
+                                   embedding_init=nn.initializers.normal(0.02), dtype=self.dtype)
 
         use_dropout = self.dropout_prob > 0
         if (train and use_dropout) or (force_drop_ids is not None):
             labels = self.token_drop(labels, force_drop_ids)
         embeddings = embedding_table(labels)
         return embeddings
-
-class MlpBlock(nn.Module):
-    """Transformer MLP / feed-forward block."""
-
-    mlp_dim: int
-    dtype: Dtype
-    out_dim: Optional[int] = None
-    dropout_rate: float = None
-    kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = nn.initializers.xavier_uniform()
-    bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = nn.initializers.normal(stddev=1e-6)
-    train: bool = False
-
-    @nn.compact
-    def __call__(self, inputs):
-        """It's just an MLP, so the input shape is (batch, len, emb)."""
-        actual_out_dim = inputs.shape[-1] if self.out_dim is None else self.out_dim
-        x = nn.Dense(
-                features=self.mlp_dim,
-                dtype=self.dtype,
-                kernel_init=self.kernel_init,
-                bias_init=self.bias_init)(inputs)
-        x = nn.gelu(x)
-        x = nn.Dropout(rate=self.dropout_rate, deterministic=(not self.train))(x)
-        output = nn.Dense(
-                features=actual_out_dim,
-                dtype=self.dtype,
-                kernel_init=self.kernel_init,
-                bias_init=self.bias_init)(x)
-        output = nn.Dropout(rate=self.dropout_rate, deterministic=(not self.train))(output)
-        return output
     
 class PatchEmbed(nn.Module):
     """ 2D Image to Patch Embedding """
     patch_size: int
     embed_dim: int
+    kernel_init: Callable
     dtype: Dtype
     bias: bool = True
 
@@ -159,55 +145,38 @@ class PatchEmbed(nn.Module):
         B, H, W, C = x.shape
         patch_tuple = (self.patch_size, self.patch_size)
         num_patches = (H // self.patch_size)
-        x = nn.Conv(self.embed_dim, patch_tuple, patch_tuple, use_bias=self.bias, padding="VALID", kernel_init=nn.initializers.xavier_uniform(), dtype=self.dtype)(x) # (B, P, P, hidden_size)
+        x = nn.Conv(self.embed_dim, patch_tuple, patch_tuple, use_bias=self.bias, padding="VALID",
+                     kernel_init=self.kernel_init(), dtype=self.dtype)(x) # (B, P, P, hidden_size)
         x = rearrange(x, 'b h w c -> b (h w) c', h=num_patches, w=num_patches)
         return x
     
+class MlpBlock(nn.Module):
+    """Transformer MLP / feed-forward block."""
+
+    mlp_dim: int
+    kernel_init: Callable
+    dtype: Dtype
+    out_dim: Optional[int] = None
+    dropout_rate: float = None
+    bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = nn.initializers.normal(stddev=1e-6)
+    train: bool = False
+
+    @nn.compact
+    def __call__(self, inputs):
+        """It's just an MLP, so the input shape is (batch, len, emb)."""
+        actual_out_dim = inputs.shape[-1] if self.out_dim is None else self.out_dim
+        x = nn.Dense(features=self.mlp_dim, dtype=self.dtype, 
+                     kernel_init=self.kernel_init(), bias_init=self.bias_init)(inputs)
+        x = nn.gelu(x)
+        x = nn.Dropout(rate=self.dropout_rate, deterministic=(not self.train))(x)
+        output = nn.Dense(features=actual_out_dim, dtype=self.dtype,
+                kernel_init=self.kernel_init(), bias_init=self.bias_init)(x)
+        output = nn.Dropout(rate=self.dropout_rate, deterministic=(not self.train))(output)
+        return output
+    
 def modulate(x, shift, scale):
+    scale = jnp.clip(scale, -1, 1)
     return x * (1 + scale[:, None]) + shift[:, None]
-
-# From https://github.com/young-geng/m3ae_public/blob/master/m3ae/model.py
-def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
-    assert embed_dim % 2 == 0
-    omega = jnp.arange(embed_dim // 2, dtype=jnp.float32)
-    omega /= embed_dim / 2.
-    omega = 1. / 10000**omega  # (D/2,)
-
-    pos = pos.reshape(-1)  # (M,)
-    out = jnp.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
-
-    emb_sin = jnp.sin(out) # (M, D/2)
-    emb_cos = jnp.cos(out) # (M, D/2)
-
-    emb = jnp.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
-    return emb
-
-def get_1d_sincos_pos_embed(embed_dim, length):
-    return jnp.expand_dims(
-        get_1d_sincos_pos_embed_from_grid(embed_dim, jnp.arange(length, dtype=jnp.float32)
-        ),
-        0
-    )
-
-def get_2d_sincos_pos_embed(rng, embed_dim, length):
-    # example: embed_dim = 256, length = 16*16
-    grid_size = int(length ** 0.5)
-    assert grid_size * grid_size == length
-    def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
-        assert embed_dim % 2 == 0
-        # use half of dimensions to encode grid_h
-        emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
-        emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
-        emb = jnp.concatenate([emb_h, emb_w], axis=1) # (H*W, D)
-        return emb
-
-    grid_h = jnp.arange(grid_size, dtype=jnp.float32)
-    grid_w = jnp.arange(grid_size, dtype=jnp.float32)
-    grid = jnp.meshgrid(grid_w, grid_h)  # here w goes first
-    grid = jnp.stack(grid, axis=0)
-    grid = grid.reshape([2, 1, grid_size, grid_size])
-    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
-    return jnp.expand_dims(pos_embed, 0) # (1, H*W, D)
     
 ################################################################################
 #                                 Core DiT Model                                #
@@ -219,6 +188,7 @@ class DiTBlock(nn.Module):
     """
     hidden_size: int
     num_heads: int
+    kernel_init: Callable
     dtype: Dtype
     mlp_ratio: float = 4.0
     dropout: float = 0.0
@@ -229,21 +199,32 @@ class DiTBlock(nn.Module):
     def __call__(self, x, c):
         # Calculate adaLn modulation parameters.
         c = nn.silu(c)
-        c = nn.Dense(6 * self.hidden_size, kernel_init=nn.initializers.constant(0.), dtype=self.dtype)(c)
+        c = nn.Dense(6 * self.hidden_size, kernel_init=self.kernel_init(0), dtype=self.dtype)(c)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(c, 6, axis=-1)
         
         # Attention Residual.
         x_norm = nn.LayerNorm(use_bias=False, use_scale=False, dtype=self.dtype)(x)
         x_modulated = modulate(x_norm, shift_msa, scale_msa)
-        attn_x = nn.MultiHeadDotProductAttention(kernel_init=nn.initializers.xavier_uniform(),
-            num_heads=self.num_heads, dtype=self.dtype, dropout_rate=self.dropout, 
-            deterministic=(not self.train))(x_modulated, x_modulated)
+        channels_per_head = self.hidden_size // self.num_heads
+        k = nn.Dense(self.hidden_size, kernel_init=self.kernel_init())(x_modulated)
+        q = nn.Dense(self.hidden_size, kernel_init=self.kernel_init())(x_modulated)
+        v = nn.Dense(self.hidden_size, kernel_init=self.kernel_init())(x_modulated)
+        k = jnp.reshape(k, (k.shape[0], k.shape[1], self.num_heads, channels_per_head))
+        q = jnp.reshape(q, (q.shape[0], q.shape[1], self.num_heads, channels_per_head))
+        v = jnp.reshape(v, (v.shape[0], v.shape[1], self.num_heads, channels_per_head))
+        q = q / q.shape[3] # (1/d) scaling.
+        w = jnp.einsum('bqhc,bkhc->bhqk', q, k) # [B, HW, HW, num_heads]
+        w = nn.softmax(w, axis=-1)
+        y = jnp.einsum('bhqk,bkhc->bqhc', w, v) # [B, HW, num_heads, channels_per_head]
+        y = jnp.reshape(y, x.shape) # [B, H, W, C] (C = heads * channels_per_head)
+        attn_x = nn.Dense(self.hidden_size, kernel_init=self.kernel_init())(y)
         x = x + (gate_msa[:, None] * attn_x)
 
         # MLP Residual.
         x_norm2 = nn.LayerNorm(use_bias=False, use_scale=False, dtype=self.dtype)(x)
         x_modulated2 = modulate(x_norm2, shift_mlp, scale_mlp)
-        mlp_x = MlpBlock(mlp_dim=int(self.hidden_size * self.mlp_ratio), dtype=self.dtype, dropout_rate=self.dropout, train=self.train)(x_modulated2)
+        mlp_x = MlpBlock(mlp_dim=int(self.hidden_size * self.mlp_ratio), kernel_init=self.kernel_init,
+                         dtype=self.dtype, dropout_rate=self.dropout, train=self.train)(x_modulated2)
         x = x + (gate_mlp[:, None] * mlp_x)
         return x
     
@@ -254,17 +235,24 @@ class FinalLayer(nn.Module):
     patch_size: int
     out_channels: int
     hidden_size: int
+    kernel_init: Callable
     dtype: Dtype
 
     @nn.compact
     def __call__(self, x, c):
+        acts = []
         c = nn.silu(c)
-        c = nn.Dense(2 * self.hidden_size, kernel_init=nn.initializers.constant(0), dtype=self.dtype)(c)
+        c = nn.Dense(2 * self.hidden_size, kernel_init=self.kernel_init(0), dtype=self.dtype)(c)
         shift, scale = jnp.split(c, 2, axis=-1)
-        x = modulate(nn.LayerNorm(use_bias=False, use_scale=False, dtype=self.dtype)(x), shift, scale)
+        acts.append(shift)
+        acts.append(scale)
+        x = nn.LayerNorm(use_bias=False, use_scale=False, dtype=self.dtype)(x)
+        acts.append(x)
+        x = modulate(x, shift, scale)
+        acts.append(x)
         x = nn.Dense(self.patch_size * self.patch_size * self.out_channels, 
-                     kernel_init=nn.initializers.constant(0), dtype=self.dtype)(x)
-        return x
+                     kernel_init=self.kernel_init(0), dtype=self.dtype)(x)
+        return acts, x
 
 class DiT(nn.Module):
     """
@@ -277,46 +265,59 @@ class DiT(nn.Module):
     mlp_ratio: float
     class_dropout_prob: float
     num_classes: int
+    use_spectral_norm: bool = True
     dropout: float = 0.0
-    learn_sigma: bool = False
     dtype: Dtype = jnp.bfloat16
 
     @nn.compact
-    def __call__(self, x, t, y, train=False, force_drop_ids=None):
+    def __call__(self, x, t, y, train=False, force_drop_ids=None, return_activations=False):
         # (x = (B, H, W, C) image, t = (B,) timesteps, y = (B,) class labels)
         print("DiT: Input of shape", x.shape, "dtype", x.dtype)
+        activations = []
+
+        def kernel_init(scale=1):
+            if not self.use_spectral and scale == 0:
+                return nn.initializers.constant(0)
+            elif not self.use_spectral:
+                return nn.initializers.lecun_normal()
+            else:
+                return spectral_init(scale)
+
         batch_size = x.shape[0]
         input_size = x.shape[1]
         in_channels = x.shape[-1]
-        out_channels = in_channels if not self.learn_sigma else in_channels * 2
+        out_channels = in_channels
         num_patches = (input_size // self.patch_size) ** 2
         num_patches_side = input_size // self.patch_size
         pos_embed = self.param("pos_embed", get_2d_sincos_pos_embed, self.hidden_size, num_patches)
         pos_embed = jax.lax.stop_gradient(pos_embed)
-        x = PatchEmbed(self.patch_size, self.hidden_size, dtype=self.dtype)(x) # (B, num_patches, hidden_size)
+        x = PatchEmbed(self.patch_size, self.hidden_size, kernel_init, dtype=self.dtype)(x) # (B, num_patches, hidden_size)
+        activations.append(x)
         print("DiT: After patch embed, shape is", x.shape, "dtype", x.dtype)
         x = x + pos_embed
         x = x.astype(self.dtype)
-        t = TimestepEmbedder(self.hidden_size, dtype=self.dtype)(t) # (B, hidden_size)
-        # t = MPFourier(self.dtype, hidden_size=self.hidden_size)(t) # (B, hidden_size)
+        t = TimestepEmbedder(self.hidden_size, kernel_init, dtype=self.dtype)(t) # (B, hidden_size)
         y = LabelEmbedder(self.class_dropout_prob, self.num_classes, self.hidden_size, dtype=self.dtype)(
             y, train=train, force_drop_ids=force_drop_ids) # (B, hidden_size)
         c = t + y
 
         print("DiT: Patch Embed of shape", x.shape, "dtype", x.dtype)
         print("DiT: Conditioning of shape", c.shape, "dtype", c.dtype)
-        # print("DiT: Pos Embedding of shape", pos_embed.shape)
-        # print("DiT: Timestep Embedding of shape", t.shape)
-        # print("DiT: Label Embedding of shape", y.shape)
-
         for _ in range(self.depth):
-            x = DiTBlock(self.hidden_size, self.num_heads, self.dtype, self.mlp_ratio, self.dropout, train)(x, c)
+            x = DiTBlock(self.hidden_size, self.num_heads, kernel_init, 
+                         self.dtype, self.mlp_ratio, self.dropout, train)(x, c)
+            activations.append(x)
             print("DiT: DiTBlock of shape", x.shape, "dtype", x.dtype)
-        x = FinalLayer(self.patch_size, out_channels, self.hidden_size, dtype=self.dtype)(x, c) # (B, num_patches, p*p*c)
+        acts, x = FinalLayer(self.patch_size, out_channels, self.hidden_size, 
+                             kernel_init, dtype=self.dtype)(x, c) # (B, num_patches, p*p*c)
+        activations += acts
+        activations.append(x)
         # print("DiT: FinalLayer of shape", x.shape, "dtype", x.dtype)
         x = jnp.reshape(x, (batch_size, num_patches_side, num_patches_side, 
                             self.patch_size, self.patch_size, out_channels))
         x = jnp.einsum('bhwpqc->bhpwqc', x)
         x = rearrange(x, 'B H P W Q C -> B (H P) (W Q) C', H=int(num_patches_side), W=int(num_patches_side))
         assert x.shape == (batch_size, input_size, input_size, out_channels)
+        if return_activations:
+            return x, activations
         return x
