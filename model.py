@@ -107,6 +107,7 @@ class LabelEmbedder(nn.Module):
     dropout_prob: float
     num_classes: int
     hidden_size: int
+    lr_scale: float
     dtype: Dtype
 
     def token_drop(self, labels, force_drop_ids=None):
@@ -129,7 +130,7 @@ class LabelEmbedder(nn.Module):
         use_dropout = self.dropout_prob > 0
         if (train and use_dropout) or (force_drop_ids is not None):
             labels = self.token_drop(labels, force_drop_ids)
-        embeddings = embedding_table(labels)
+        embeddings = embedding_table(labels) * self.lr_scale
         return embeddings
     
 class PatchEmbed(nn.Module):
@@ -137,6 +138,7 @@ class PatchEmbed(nn.Module):
     patch_size: int
     embed_dim: int
     kernel_init: Callable
+    lr_scale: float
     dtype: Dtype
     bias: bool = True
 
@@ -146,7 +148,7 @@ class PatchEmbed(nn.Module):
         patch_tuple = (self.patch_size, self.patch_size)
         num_patches = (H // self.patch_size)
         x = nn.Conv(self.embed_dim, patch_tuple, patch_tuple, use_bias=self.bias, padding="VALID",
-                     kernel_init=self.kernel_init(), dtype=self.dtype)(x) # (B, P, P, hidden_size)
+                     kernel_init=self.kernel_init(lr_scale=self.lr_scale), dtype=self.dtype)(x) # (B, P, P, hidden_size)
         x = rearrange(x, 'b h w c -> b (h w) c', h=num_patches, w=num_patches)
         return x
     
@@ -235,6 +237,7 @@ class FinalLayer(nn.Module):
     patch_size: int
     out_channels: int
     hidden_size: int
+    lr_scale: float
     kernel_init: Callable
     dtype: Dtype
 
@@ -244,15 +247,11 @@ class FinalLayer(nn.Module):
         c = nn.silu(c)
         c = nn.Dense(2 * self.hidden_size, kernel_init=self.kernel_init(0), dtype=self.dtype)(c)
         shift, scale = jnp.split(c, 2, axis=-1)
-        acts.append(shift)
-        acts.append(scale)
         x = nn.LayerNorm(use_bias=False, use_scale=False, dtype=self.dtype)(x)
-        acts.append(x)
         x = modulate(x, shift, scale)
-        acts.append(x)
         x = nn.Dense(self.patch_size * self.patch_size * self.out_channels, 
-                     kernel_init=self.kernel_init(0), dtype=self.dtype)(x)
-        return acts, x
+                     kernel_init=self.kernel_init(init_scale=0, lr_scale=self.lr_scale), dtype=self.dtype)(x)
+        return x
 
 class DiT(nn.Module):
     """
@@ -265,6 +264,9 @@ class DiT(nn.Module):
     mlp_ratio: float
     class_dropout_prob: float
     num_classes: int
+    lr_scale_patch: float = 1.0
+    lr_scale_embed: float = 1.0
+    lr_scale_final: float = 1.0
     use_spectral_norm: bool = True
     dropout: float = 0.0
     dtype: Dtype = jnp.bfloat16
@@ -273,15 +275,15 @@ class DiT(nn.Module):
     def __call__(self, x, t, y, train=False, force_drop_ids=None, return_activations=False):
         # (x = (B, H, W, C) image, t = (B,) timesteps, y = (B,) class labels)
         print("DiT: Input of shape", x.shape, "dtype", x.dtype)
-        activations = []
+        activations = {}
 
-        def kernel_init(scale=1):
-            if not self.use_spectral and scale == 0:
+        def kernel_init(init_scale=1, lr_scale=1):
+            if not self.use_spectral_norm and init_scale == 0:
                 return nn.initializers.constant(0)
-            elif not self.use_spectral:
+            elif not self.use_spectral_norm:
                 return nn.initializers.lecun_normal()
             else:
-                return spectral_init(scale)
+                return spectral_init(init_scale=init_scale, lr_scale=lr_scale)
 
         batch_size = x.shape[0]
         input_size = x.shape[1]
@@ -291,27 +293,33 @@ class DiT(nn.Module):
         num_patches_side = input_size // self.patch_size
         pos_embed = self.param("pos_embed", get_2d_sincos_pos_embed, self.hidden_size, num_patches)
         pos_embed = jax.lax.stop_gradient(pos_embed)
-        x = PatchEmbed(self.patch_size, self.hidden_size, kernel_init, dtype=self.dtype)(x) # (B, num_patches, hidden_size)
-        activations.append(x)
+        x = PatchEmbed(self.patch_size, self.hidden_size, kernel_init, self.lr_scale_patch, dtype=self.dtype)(x) # (B, num_patches, hidden_size)
         print("DiT: After patch embed, shape is", x.shape, "dtype", x.dtype)
+        activations['patch_embed'] = x
+
         x = x + pos_embed
         x = x.astype(self.dtype)
         t = TimestepEmbedder(self.hidden_size, kernel_init, dtype=self.dtype)(t) # (B, hidden_size)
-        y = LabelEmbedder(self.class_dropout_prob, self.num_classes, self.hidden_size, dtype=self.dtype)(
+        y = LabelEmbedder(self.class_dropout_prob, self.num_classes, 
+                          self.hidden_size, self.lr_scale_embed, dtype=self.dtype)(
             y, train=train, force_drop_ids=force_drop_ids) # (B, hidden_size)
         c = t + y
+        
+        activations['pos_embed'] = pos_embed
+        activations['time_embed'] = t
+        activations['label_embed'] = y
+        activations['conditioning'] = c
 
         print("DiT: Patch Embed of shape", x.shape, "dtype", x.dtype)
         print("DiT: Conditioning of shape", c.shape, "dtype", c.dtype)
-        for _ in range(self.depth):
+        for i in range(self.depth):
             x = DiTBlock(self.hidden_size, self.num_heads, kernel_init, 
                          self.dtype, self.mlp_ratio, self.dropout, train)(x, c)
-            activations.append(x)
+            activations[f'dit_block_{i}'] = x
             print("DiT: DiTBlock of shape", x.shape, "dtype", x.dtype)
-        acts, x = FinalLayer(self.patch_size, out_channels, self.hidden_size, 
+        x = FinalLayer(self.patch_size, out_channels, self.hidden_size, self.lr_scale_final,
                              kernel_init, dtype=self.dtype)(x, c) # (B, num_patches, p*p*c)
-        activations += acts
-        activations.append(x)
+        activations['final_layer'] = x
         # print("DiT: FinalLayer of shape", x.shape, "dtype", x.dtype)
         x = jnp.reshape(x, (batch_size, num_patches_side, num_patches_side, 
                             self.patch_size, self.patch_size, out_channels))

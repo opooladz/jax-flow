@@ -43,17 +43,20 @@ flags.DEFINE_integer('debug_overfit', 0, 'Debug overfitting.')
 
 model_config = ml_collections.ConfigDict({
     # Make sure to run with Large configs when we actually want to run!
-    'lr': 0.0001,
+    'lr': 0.1,
+    'lr_scale_patch': 1.0,
+    'lr_scale_embed': 1.0,
+    'lr_scale_final': 1.0,
     'beta1': 0.9,
     'beta2': 0.999,
     'weight_decay': 0.0,
     'warmup': 0,
     'use_spectral_norm': 1,
     'hidden_size': 64, 
-    'patch_size': 8, 
-    'depth': 2,
-    'num_heads': 2,
-    'mlp_ratio': 1,
+    'patch_size': 2, 
+    'depth': 4,
+    'num_heads': 4,
+    'mlp_ratio': 4,
     'dropout': 0.0,
     'class_dropout_prob': 0.1,
     'num_classes': 1000,
@@ -83,10 +86,6 @@ config_flags.DEFINE_config_dict('model', model_config, lock_config=False)
 ## Training Code.
 ##############################################
 def main(_):
-
-    # preset_dict = preset_configs[FLAGS.model.preset]
-    # for k, v in preset_dict.items():
-    #     FLAGS.model[k] = v
 
     np.random.seed(FLAGS.seed)
     print("Using devices", jax.local_devices())
@@ -138,10 +137,20 @@ def main(_):
         'num_classes': FLAGS.model['num_classes'],
         'dropout': FLAGS.model['dropout'],
         'use_spectral_norm': FLAGS.model['use_spectral_norm'],
+        'lr_scale_patch': FLAGS.model['lr_scale_patch'],
+        'lr_scale_embed': FLAGS.model['lr_scale_embed'],
+        'lr_scale_final': FLAGS.model['lr_scale_final'],
     }
     model_def = DiT(**dit_args)
     tabulate_fn = flax.linen.tabulate(model_def, jax.random.PRNGKey(0))
     print(tabulate_fn(example_obs, jnp.zeros((1,)), jnp.zeros((1,), dtype=jnp.int32)))
+
+    lr = FLAGS.model['lr'] if FLAGS.model.warmup == 0 else optax.linear_schedule(0.0, FLAGS.model['lr'], FLAGS.model['warmup'])
+    adam = optax.adamw(learning_rate=lr, b1=FLAGS.model['beta1'], b2=FLAGS.model['beta2'], weight_decay=FLAGS.model['weight_decay'])
+    if FLAGS.model.use_spectral_norm:
+        tx = optax.chain(adam, scale_spectral_norm())
+    else:
+        tx = optax.chain(adam)
     
     def init(rng):
         param_key, dropout_key, dropout2_key = jax.random.split(rng, 3)
@@ -150,18 +159,6 @@ def main(_):
         example_obs = jnp.zeros(example_obs_shape)
         model_rngs = {'params': param_key, 'label_dropout': dropout_key, 'dropout': dropout2_key}
         params = model_def.init(model_rngs, example_obs, example_t, example_label)['params']
-
-        if FLAGS.model.warmup > 0:
-            schedule = optax.linear_schedule(0.0, FLAGS.model['lr'], FLAGS.model['warmup'])
-        else:
-            schedule = FLAGS.model['lr']
-        tx_chain = (optax.adamw(learning_rate=schedule, b1=FLAGS.model['beta1'], b2=FLAGS.model['beta2'], weight_decay=FLAGS.model['weight_decay']))
-
-        if FLAGS.model.use_spectral_norm:
-            tx = optax.chain(tx_chain, scale_spectral_norm())
-        else:
-            tx = optax.chain(tx_chain)
-
         opt_state = tx.init(params)
         return TrainStateEps.create(model_def, params, rng=rng, tx=tx, opt_state=opt_state)
     
@@ -231,19 +228,15 @@ def main(_):
                 t = jnp.zeros_like(t)
             
             rngs = {'label_dropout': label_key, 'dropout': dropout_key}
-            # v_prime = train_state.call_model(x_t, t, labels, train=True, rngs=rngs, params=grad_params)
-            (v_prime, activations), intermediates = train_state.call_model(x_t, t, labels, train=True, rngs=rngs, params=grad_params, capture_intermediates=True, mutable=["intermediates"], return_activations=True)
+            v_prime, activations = train_state.call_model(x_t, t, labels, train=True, rngs=rngs, 
+                                                          params=grad_params, return_activations=True)
             loss = jnp.mean((v_prime - v_t) ** 2)
-
-            intermediates = jax.tree_util.tree_map(lambda tensor: jnp.mean(jnp.abs(tensor.ravel())), intermediates)
-            intermediates = jax.tree_util.tree_leaves(intermediates)
             
             return loss, {
                 'l2_loss': loss,
                 'v_abs_mean': jnp.abs(v_t).mean(),
                 'v_pred_abs_mean': jnp.abs(v_prime).mean(),
-                'intermediates_mean': jnp.mean(jnp.array(intermediates)),
-                **{'activations/' + str(k): jnp.mean(jnp.abs(activations[k])) for k in range(len(activations))}
+                **{'activations/' + k : jnp.mean(jnp.abs(v)) for k, v in activations.items()}
             }
         
         grads, info = jax.grad(loss_fn, has_aux=True)(train_state.params)
@@ -507,13 +500,6 @@ def main(_):
             if jax.process_index() == 0:
                 print(train_metrics)
                 wandb.log(train_metrics, step=i)
-
-                # write a copy to local file.
-                with open(f'logs/{FLAGS.wandb.group}-{FLAGS.wandb.name}.json', 'w') as f:
-                    import json
-                    train_metrics_float = {k: float(v) for k, v in train_metrics.items()}
-                    train_metrics_float['step'] = i
-                    json.dump(train_metrics_float, f)
 
         if i % FLAGS.eval_interval == 0:
             eval_model(train_state)
