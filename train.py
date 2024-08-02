@@ -25,7 +25,6 @@ from utils.checkpoint import Checkpoint
 from utils.stable_vae import StableVAE
 from utils.sharding import create_sharding
 from utils.datasets import get_dataset
-from utils.spectral_optimizer import spectral_init, scale_spectral_norm
 from model import DiT
 
 FLAGS = flags.FLAGS
@@ -43,16 +42,11 @@ flags.DEFINE_integer('debug_overfit', 0, 'Debug overfitting.')
 
 model_config = ml_collections.ConfigDict({
     # Make sure to run with Large configs when we actually want to run!
-    'lr': 0.05,
-    'lr_scale_patch': 1.0,
-    'lr_scale_embed': 1.0,
-    'lr_scale_final': 1.0,
-    'lr_scale_time': 1.0,
+    'lr': 0.0002,
     'beta1': 0.9,
     'beta2': 0.999,
     'weight_decay': 0.0,
     'warmup': 0,
-    'use_spectral_norm': 1,
     'hidden_size': 64, 
     'patch_size': 2, 
     'depth': 4,
@@ -137,11 +131,6 @@ def main(_):
         'class_dropout_prob': FLAGS.model['class_dropout_prob'],
         'num_classes': FLAGS.model['num_classes'],
         'dropout': FLAGS.model['dropout'],
-        'use_spectral_norm': FLAGS.model['use_spectral_norm'],
-        'lr_scale_patch': FLAGS.model['lr_scale_patch'],
-        'lr_scale_embed': FLAGS.model['lr_scale_embed'],
-        'lr_scale_final': FLAGS.model['lr_scale_final'],
-        'lr_scale_time': FLAGS.model['lr_scale_time'],
     }
     model_def = DiT(**dit_args)
     tabulate_fn = flax.linen.tabulate(model_def, jax.random.PRNGKey(0))
@@ -149,10 +138,7 @@ def main(_):
 
     lr = FLAGS.model['lr'] if FLAGS.model.warmup == 0 else optax.linear_schedule(0.0, FLAGS.model['lr'], FLAGS.model['warmup'])
     adam = optax.adamw(learning_rate=lr, b1=FLAGS.model['beta1'], b2=FLAGS.model['beta2'], weight_decay=FLAGS.model['weight_decay'])
-    if FLAGS.model.use_spectral_norm:
-        tx = optax.chain(adam, scale_spectral_norm())
-    else:
-        tx = optax.chain(adam)
+    tx = optax.chain(adam)
     
     def init(rng):
         param_key, dropout_key, dropout2_key = jax.random.split(rng, 3)
