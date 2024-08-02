@@ -309,6 +309,7 @@ class DiT(nn.Module):
                           self.hidden_size, self.lr_scale_embed, dtype=self.dtype)(
             y, train=train, force_drop_ids=force_drop_ids) # (B, hidden_size)
         c = t + y
+        c = nn.LayerNorm(use_bias=False, use_scale=False, dtype=self.dtype)(c)
         
         activations['pos_embed'] = pos_embed
         activations['time_embed'] = t
