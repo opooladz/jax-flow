@@ -34,6 +34,7 @@ def default_wandb_config():
     experiment_name = FieldReference(None, field_type=str) # Experiment name
     config.name = experiment_name  # Run name (will be formatted with flags / variant)
     config.exp_descriptor = experiment_name  # Run name (deprecated, but kept for backwards compatibility)
+    config.run_id = None # For continuing a run
 
     config.unique_identifier = ""  # Unique identifier for run (will be automatically generated unless provided)
     config.random_delay = 0  # Random delay for wandb.init (in seconds)
@@ -41,7 +42,7 @@ def default_wandb_config():
 
 
 def setup_wandb(hyperparam_dict, entity=None, project="jaxgm_default", group=None, name=None,
-    unique_identifier="", offline=False, random_delay=0, **additional_init_kwargs):
+    unique_identifier="", offline=False, random_delay=0, run_id=None, **additional_init_kwargs):
     if "exp_descriptor" in additional_init_kwargs:
         # Remove deprecated exp_descriptor
         additional_init_kwargs.pop("exp_descriptor")
@@ -83,8 +84,14 @@ def setup_wandb(hyperparam_dict, entity=None, project="jaxgm_default", group=Non
             _disable_stats=False,
         ), mode="offline" if offline else "online", save_code=True,
     )
-
     init_kwargs.update(additional_init_kwargs)
+
+    if run_id is not None: # Resume a run
+        init_kwargs.update({
+            "id": run_id,
+            "resume": "must",
+        })
+
     run = wandb.init(**init_kwargs)
 
     wandb.config.update(get_flag_dict())

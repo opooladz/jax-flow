@@ -43,10 +43,11 @@ flags.DEFINE_integer('debug_overfit', 0, 'Debug overfitting.')
 
 model_config = ml_collections.ConfigDict({
     # Make sure to run with Large configs when we actually want to run!
-    'lr': 0.1,
+    'lr': 0.05,
     'lr_scale_patch': 1.0,
     'lr_scale_embed': 1.0,
     'lr_scale_final': 1.0,
+    'lr_scale_time': 1.0,
     'beta1': 0.9,
     'beta2': 0.999,
     'weight_decay': 0.0,
@@ -140,6 +141,7 @@ def main(_):
         'lr_scale_patch': FLAGS.model['lr_scale_patch'],
         'lr_scale_embed': FLAGS.model['lr_scale_embed'],
         'lr_scale_final': FLAGS.model['lr_scale_final'],
+        'lr_scale_time': FLAGS.model['lr_scale_time'],
     }
     model_def = DiT(**dit_args)
     tabulate_fn = flax.linen.tabulate(model_def, jax.random.PRNGKey(0))
@@ -509,6 +511,7 @@ def main(_):
             if jax.process_index() == 0:
                 cp = Checkpoint(FLAGS.save_dir, parallel=False)
                 cp.train_state = train_state_gather
+                cp.wandb_id = wandb.run.id # For resuming the run.
                 cp.save()
                 del cp
             del train_state_gather
