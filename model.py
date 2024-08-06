@@ -70,9 +70,9 @@ class TimestepEmbedder(nn.Module):
     @nn.compact
     def __call__(self, t):
         x = self.timestep_embedding(t)
-        x = nn.Dense(self.hidden_size, nn.initializers.normal(0.02), dtype=self.dtype)(x)
+        x = nn.Dense(self.hidden_size, dtype=self.dtype)(x)
         x = nn.silu(x)
-        x = nn.Dense(self.hidden_size, nn.initializers.normal(0.02), dtype=self.dtype)(x)
+        x = nn.Dense(self.hidden_size, dtype=self.dtype)(x)
         return x
 
     # t is between [0, 1].
@@ -141,7 +141,7 @@ class PatchEmbed(nn.Module):
         patch_tuple = (self.patch_size, self.patch_size)
         num_patches = (H // self.patch_size)
         x = nn.Conv(self.hidden_size, patch_tuple, patch_tuple, use_bias=self.bias, padding="VALID",
-                     kernel_init=nn.initializers.xavier_uniform(), 
+                     kernel_init=nn.initializers.lecun_normal(), 
                      dtype=self.dtype)(x) # (B, P, P, hidden_size)
         x = rearrange(x, 'b h w c -> b (h w) c', h=num_patches, w=num_patches)
         return x
@@ -153,24 +153,21 @@ class MlpBlock(nn.Module):
     dtype: Dtype
     out_dim: Optional[int] = None
     dropout_rate: float = None
-    kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = nn.initializers.xavier_uniform()
-    bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = nn.initializers.normal(stddev=1e-6)
     train: bool = False
 
     @nn.compact
     def __call__(self, inputs):
         """It's just an MLP, so the input shape is (batch, len, emb)."""
         actual_out_dim = inputs.shape[-1] if self.out_dim is None else self.out_dim
-        x = nn.Dense(features=self.mlp_dim, dtype=self.dtype, 
-                     kernel_init=self.kernel_init, bias_init=self.bias_init)(inputs)
+        x = nn.Dense(features=self.mlp_dim, dtype=self.dtype)(inputs)
         x = nn.gelu(x)
         x = nn.Dropout(rate=self.dropout_rate, deterministic=(not self.train))(x)
-        output = nn.Dense(features=actual_out_dim, dtype=self.dtype,
-                     kernel_init=self.kernel_init, bias_init=self.bias_init)(inputs)
+        output = nn.Dense(features=actual_out_dim, dtype=self.dtype)(inputs)
         output = nn.Dropout(rate=self.dropout_rate, deterministic=(not self.train))(output)
         return output
     
 def modulate(x, shift, scale):
+    scale = jnp.clip(scale, -1, 1)
     return x * (1 + scale[:, None]) + shift[:, None]
     
 ################################################################################
@@ -206,7 +203,7 @@ class DiTBlock(nn.Module):
         k = jnp.reshape(k, (k.shape[0], k.shape[1], self.num_heads, channels_per_head))
         q = jnp.reshape(q, (q.shape[0], q.shape[1], self.num_heads, channels_per_head))
         v = jnp.reshape(v, (v.shape[0], v.shape[1], self.num_heads, channels_per_head))
-        q = q / jnp.sqrt(q.shape[3]) # (1/d) scaling.
+        q = q / q.shape[3] # (1/d) scaling.
         w = jnp.einsum('bqhc,bkhc->bhqk', q, k) # [B, HW, HW, num_heads]
         w = nn.softmax(w, axis=-1)
         y = jnp.einsum('bhqk,bkhc->bqhc', w, v) # [B, HW, num_heads, channels_per_head]
