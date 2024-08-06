@@ -40,20 +40,12 @@ flags.DEFINE_integer('batch_size', 256, 'Mini batch size.')
 flags.DEFINE_integer('max_steps', int(1_000_000), 'Number of training steps.')
 flags.DEFINE_integer('debug_overfit', 0, 'Debug overfitting.')
 
-model_config = ml_collections.ConfigDict({
-    # Make sure to run with Large configs when we actually want to run!
+train_config = ml_collections.ConfigDict({
     'lr': 0.0002,
     'beta1': 0.9,
     'beta2': 0.999,
     'weight_decay': 0.0,
     'warmup': 0,
-    'hidden_size': 64, 
-    'patch_size': 2, 
-    'depth': 4,
-    'num_heads': 4,
-    'mlp_ratio': 4,
-    'dropout': 0.0,
-    'parallel_block': 0,
     'class_dropout_prob': 0.1,
     'num_classes': 1000,
     'denoise_timesteps': 32,
@@ -69,6 +61,15 @@ model_config = ml_collections.ConfigDict({
     'augmentation': 0,
 })
 
+model_config = ml_collections.ConfigDict({
+    'hidden_size': 64, 
+    'patch_size': 2, 
+    'depth': 4,
+    'num_heads': 4,
+    'mlp_ratio': 4,
+    'dropout': 0.0,
+})
+
 wandb_config = default_wandb_config()
 wandb_config.update({
     'project': 'flow',
@@ -76,6 +77,7 @@ wandb_config.update({
 })
 
 config_flags.DEFINE_config_dict('wandb', wandb_config, lock_config=False)
+config_flags.DEFINE_config_dict('config', train_config, lock_config=False)
 config_flags.DEFINE_config_dict('model', model_config, lock_config=False)
     
 ##############################################
@@ -87,17 +89,16 @@ def main(_):
     print("Using devices", jax.local_devices())
     device_count = len(jax.local_devices())
     global_device_count = jax.device_count()
-    num_hosts = global_device_count // device_count
+    local_batch_size = FLAGS.batch_size // (global_device_count // device_count)
     print("Device count", device_count)
     print("Global device count", global_device_count)
-    local_batch_size = FLAGS.batch_size // (global_device_count // device_count)
     print("Global Batch: ", FLAGS.batch_size)
     print("Node Batch: ", local_batch_size)
     print("Device Batch:", local_batch_size // device_count)
 
     # Create wandb logger
     if jax.process_index() == 0:
-        setup_wandb(FLAGS.model.to_dict(), **FLAGS.wandb)
+        setup_wandb({**FLAGS.config.to_dict(), **FLAGS.model.to_dict()}, **FLAGS.wandb)
 
     dataset = get_dataset(FLAGS.dataset_name, local_batch_size, True, FLAGS.debug_overfit)
     dataset_valid = get_dataset(FLAGS.dataset_name, local_batch_size, False, FLAGS.debug_overfit)
@@ -105,8 +106,8 @@ def main(_):
     example_obs = example_obs[:1]
     example_obs_shape = example_obs.shape
 
-    if FLAGS.model.use_stable_vae:
-        vae = StableVAE.create(vae_type=FLAGS.model.vae_type)
+    if FLAGS.config.use_stable_vae:
+        vae = StableVAE.create(vae_type=FLAGS.config.vae_type)
         example_obs = vae.encode(jax.random.PRNGKey(0), example_obs)
         example_obs_shape = example_obs.shape
         vae_rng = jax.random.PRNGKey(42)
@@ -121,25 +122,13 @@ def main(_):
     ###################################
     # Creating Model and put on devices.
     ###################################
-    FLAGS.model.image_channels = example_obs_shape[-1]
-    FLAGS.model.image_size = example_obs_shape[1]
-    dit_args = {
-        'patch_size': FLAGS.model['patch_size'],
-        'hidden_size': FLAGS.model['hidden_size'],
-        'depth': FLAGS.model['depth'],
-        'num_heads': FLAGS.model['num_heads'],
-        'mlp_ratio': FLAGS.model['mlp_ratio'],
-        'class_dropout_prob': FLAGS.model['class_dropout_prob'],
-        'num_classes': FLAGS.model['num_classes'],
-        'dropout': FLAGS.model['dropout'],
-        'parallel_block': FLAGS.model['parallel_block'],
-    }
-    model_def = DiT(**dit_args)
+    FLAGS.model['num_classes'] = FLAGS.config['num_classes']
+    model_def = DiT(**FLAGS.model)
     tabulate_fn = flax.linen.tabulate(model_def, jax.random.PRNGKey(0))
     print(tabulate_fn(example_obs, jnp.zeros((1,)), jnp.zeros((1,), dtype=jnp.int32)))
 
-    lr = FLAGS.model['lr'] if FLAGS.model.warmup == 0 else optax.linear_schedule(0.0, FLAGS.model['lr'], FLAGS.model['warmup'])
-    adam = optax.adamw(learning_rate=lr, b1=FLAGS.model['beta1'], b2=FLAGS.model['beta2'], weight_decay=FLAGS.model['weight_decay'])
+    lr = FLAGS.config['lr'] if FLAGS.config.warmup == 0 else optax.linear_schedule(0.0, FLAGS.config['lr'], FLAGS.config['warmup'])
+    adam = optax.adamw(learning_rate=lr, b1=FLAGS.config['beta1'], b2=FLAGS.config['beta2'], weight_decay=FLAGS.config['weight_decay'])
     tx = optax.chain(adam)
     
     def init(rng):
@@ -155,9 +144,9 @@ def main(_):
     # Sharded Parameters (either replicated, or fsdp).
     rng = jax.random.PRNGKey(FLAGS.seed)
     train_state_shape = jax.eval_shape(init, rng)
-    data_sharding, train_state_sharding, no_shard, shard_data, global_to_local = create_sharding(FLAGS.model.sharding, train_state_shape)
+    data_sharding, train_state_sharding, no_shard, shard_data, global_to_local = create_sharding(FLAGS.config.sharding, train_state_shape)
     train_state = jax.jit(init, out_shardings=train_state_sharding)(rng)
-    # jax.debug.visualize_array_sharding(train_state.params['FinalLayer_0']['Dense_0']['kernel'].value)
+    jax.debug.visualize_array_sharding(train_state.params['FinalLayer_0']['Dense_0']['kernel'])
 
     if FLAGS.load_dir is not None:
         cp = Checkpoint(FLAGS.load_dir)
@@ -165,7 +154,6 @@ def main(_):
         train_state = train_state.replace(**replace_dict)
         train_state = jax.jit(lambda x : x, out_shardings=train_state_sharding)(train_state)
         print("Loaded model with step", train_state.step)
-        # jax.debug.visualize_array_sharding(train_state.params['FinalLayer_0']['Dense_0']['kernel'].value)
         del cp
 
     visualize_labels = example_labels[:global_device_count]
@@ -197,28 +185,31 @@ def main(_):
 
         def loss_fn(grad_params):
             # Sample a t for training.
-            if FLAGS.model['t_sampler'] == 'log-normal':
+            if FLAGS.config['t_sampler'] == 'log-normal':
                 t = jax.random.normal(time_key, (images.shape[0],))
                 t = ((1 / (1 + jnp.exp(-t))))
-            elif FLAGS.model['t_sampler'] == 'uniform':
+            elif FLAGS.config['t_sampler'] == 'uniform':
                 t = jax.random.uniform(time_key, (images.shape[0],), minval=0, maxval=1)
-            elif FLAGS.model['t_sampler'] == 'permutation':
+            elif FLAGS.config['t_sampler'] == 'permutation':
                 t = jnp.arange(images.shape[0]) / images.shape[0]
                 t = jax.random.permutation(time_key, t)
-            elif FLAGS.model['t_sampler'] == 'discrete':
-                t = jax.random.randint(time_key, (images.shape[0],), 0, FLAGS.model['denoise_timesteps']) / FLAGS.model['denoise_timesteps']
-            elif FLAGS.model['t_sampler'] == 'debug-constant':
+            elif FLAGS.config['t_sampler'] == 'discrete':
+                t = jax.random.randint(time_key, (images.shape[0],), 0, FLAGS.config['denoise_timesteps']) / FLAGS.config['denoise_timesteps']
+            elif FLAGS.config['t_sampler'] == 'debug-constant':
                 t = jnp.ones((images.shape[0],)) * 0.5
             t_full = t[:, None, None, None] # [batch, 1, 1, 1]
             eps = jax.random.normal(noise_key, images.shape)
             x_t = get_x_t(images, eps, t_full)
             v_t = get_v(images, eps)
 
-            if FLAGS.model['t_conditioning'] == 0:
+            if FLAGS.config['t_conditioning'] == 0:
                 t = jnp.zeros_like(t)
+
+            labels_dropout = jax.random.bernoulli(label_key, FLAGS.config['class_dropout_prob'], (labels.shape[0],))
+            labels_dropped = jnp.where(labels_dropout, FLAGS.config['num_classes'], labels)
             
-            rngs = {'label_dropout': label_key, 'dropout': dropout_key}
-            v_prime, activations = train_state.call_model(x_t, t, labels, train=True, rngs=rngs, 
+            v_prime, activations = train_state.call_model(x_t, t, labels_dropped,
+                                                          train=True, rngs={'dropout': dropout_key}, 
                                                           params=grad_params, return_activations=True)
             loss = jnp.mean((v_prime - v_t) ** 2)
             
@@ -238,10 +229,10 @@ def main(_):
         info['param_norm'] = optax.global_norm(new_params)
         info['norms/final_layer'] = optax.global_norm(new_params['FinalLayer_0']['Dense_0']['kernel'])
         info['norms/patch'] = optax.global_norm(new_params['PatchEmbed_0']['Conv_0']['kernel'])
-        info['norms/embed'] = optax.global_norm(new_params['LabelEmbedder_0']['Embed_0']['embedding'])
+        info['norms/embed'] = optax.global_norm(new_params['LabelEmbed_0']['Embed_0']['embedding'])
 
         train_state = train_state.replace(rng=new_rng, step=train_state.step + 1, params=new_params, opt_state=new_opt_state)
-        train_state = train_state.update_eps(FLAGS.model['target_update_rate'])
+        train_state = train_state.update_eps(FLAGS.config['target_update_rate'])
         return train_state, info
 
     ###################################
@@ -252,7 +243,7 @@ def main(_):
         with jax.spmd_mode('allow_all'):
             # Needs to be in a separate function so garbage collection works correctly.
             def process_img(img):
-                if FLAGS.model.use_stable_vae:
+                if FLAGS.config.use_stable_vae:
                     img = vae_decode(img[None])[0]
                 img = img * 0.5 + 0.5
                 img = jnp.clip(img, 0, 1)
@@ -263,7 +254,7 @@ def main(_):
             # Validation Losses
             valid_images, valid_labels = next(dataset_valid)
             valid_images_sharded, valid_labels_sharded = shard_data(valid_images, valid_labels)
-            if FLAGS.model.use_stable_vae:
+            if FLAGS.config.use_stable_vae:
                 valid_images_sharded = vae_encode(vae_rng, valid_images_sharded)
                 valid_images = vae_encode(vae_rng, valid_images)
             _, valid_update_info = update(train_state, valid_images_sharded, valid_labels_sharded)
@@ -280,7 +271,7 @@ def main(_):
                 if not use_cfg:
                     return train_state.call_model_eps(images, t, labels, train=False, force_drop_ids=False)
                 else:
-                    labels_uncond = jnp.ones(labels.shape, dtype=jnp.int32) * FLAGS.model['num_classes'] # Null token
+                    labels_uncond = jnp.ones(labels.shape, dtype=jnp.int32) * FLAGS.config['num_classes'] # Null token
                     v_pred_uncond = train_state.call_model_eps(images, t, labels_uncond, train=False, force_drop_ids=False)
                     v_pred_label = train_state.call_model_eps(images, t, labels, train=False, force_drop_ids=False)
                     v = v_pred_uncond + cfg_scale * (v_pred_label - v_pred_uncond)
@@ -288,7 +279,7 @@ def main(_):
 
             print("Training Loss")
             # Training loss on various t.
-            if FLAGS.model.use_stable_vae:
+            if FLAGS.config.use_stable_vae:
                 batch_images_enc = vae_encode(vae_rng, batch_images)
             else:
                 batch_images_enc = batch_images
@@ -366,14 +357,14 @@ def main(_):
             # Full Denoising with different CFG;
             key = jax.random.PRNGKey(42 + jax.process_index() + i)
             eps = jax.random.normal(key, visualize_images_shape) # [devices, batch//devices, etc..]
-            delta_t = 1.0 / FLAGS.model.denoise_timesteps
+            delta_t = 1.0 / FLAGS.config.denoise_timesteps
             for cfg_scale in [None, 0, 1.5, 4]:
                 x = eps
                 x = shard_data(x)
                 all_x = []
-                for ti in range(FLAGS.model.denoise_timesteps):
+                for ti in range(FLAGS.config.denoise_timesteps):
                     print(ti)
-                    t = ti / FLAGS.model.denoise_timesteps # From x_0 (noise) to x_1 (data)
+                    t = ti / FLAGS.config.denoise_timesteps # From x_0 (noise) to x_1 (data)
                     t_vector = jnp.full((visualize_images_shape[0],), t)
                     t_vector = shard_data(t_vector)
                     if cfg_scale is None:
@@ -381,7 +372,7 @@ def main(_):
                     else:
                         v = call_model(train_state, x, t_vector, visualize_labels, True, cfg_scale)
                     x = x + v * delta_t
-                    if ti % (FLAGS.model.denoise_timesteps // 8) == 0 or ti == FLAGS.model.denoise_timesteps-1:
+                    if ti % (FLAGS.config.denoise_timesteps // 8) == 0 or ti == FLAGS.config.denoise_timesteps-1:
                         np_x = jax.experimental.multihost_utils.process_allgather(x)
                         all_x.append(np.array(np_x))
                 all_x = np.stack(all_x, axis=1) # [devices, batch//devices, timesteps, etc..]
@@ -409,7 +400,7 @@ def main(_):
                     t = ti / denoise_timesteps # From x_0 (noise) to x_1 (data)
                     t_vector = jnp.full((visualize_images_shape[0],), t)
                     t_vector = shard_data(t_vector)
-                    v = call_model(train_state, x, t_vector, visualize_labels, True, FLAGS.model.cfg_scale)
+                    v = call_model(train_state, x, t_vector, visualize_labels, True, FLAGS.config.cfg_scale)
                     x = x + v * delta_t
                 x = jax.experimental.multihost_utils.process_allgather(x)
                 if jax.process_index() == 0:
@@ -425,22 +416,22 @@ def main(_):
             print("FID calc")
             # # FID calculation.
             if FLAGS.fid_stats is not None:
-                cfg_list = [0] if FLAGS.model.cfg_scale == 0 else [-1, 0, 1.5, 4]
+                cfg_list = [0] if FLAGS.config.cfg_scale == 0 else [-1, 0, 1.5, 4]
                 for cfg_scale in cfg_list:
                     activations = []
                     valid_images_shape = valid_images.shape
                     num_generations = 4096
                     for fid_it in tqdm.tqdm(range(num_generations // FLAGS.batch_size)):
                         _, valid_labels = next(dataset_valid)
-                        if FLAGS.model.random_fid_labels:
-                            valid_labels = jax.random.randint(jax.random.PRNGKey(42 + fid_it), (FLAGS.batch_size,), 0, FLAGS.model.num_classes)
+                        if FLAGS.config.random_fid_labels:
+                            valid_labels = jax.random.randint(jax.random.PRNGKey(42 + fid_it), (FLAGS.batch_size,), 0, FLAGS.config.num_classes)
                         valid_labels = shard_data(valid_labels)
                         key = jax.random.PRNGKey(42 + fid_it)
                         x = jax.random.normal(key, valid_images_shape)
                         x = shard_data(x)
-                        delta_t = 1.0 / FLAGS.model.denoise_timesteps
-                        for ti in range(FLAGS.model.denoise_timesteps):
-                            t = ti / FLAGS.model.denoise_timesteps # From x_0 (noise) to x_1 (data)
+                        delta_t = 1.0 / FLAGS.config.denoise_timesteps
+                        for ti in range(FLAGS.config.denoise_timesteps):
+                            t = ti / FLAGS.config.denoise_timesteps # From x_0 (noise) to x_1 (data)
                             t_vector = jnp.full((valid_images_shape[0], ), t)
                             t_vector = shard_data(t_vector)
                             if cfg_scale == -1:
@@ -448,7 +439,7 @@ def main(_):
                             else:
                                 v = call_model(train_state, x, t_vector, valid_labels, True, cfg_scale)
                             x = x + v * delta_t
-                        if FLAGS.model.use_stable_vae:
+                        if FLAGS.config.use_stable_vae:
                             x = vae_decode(x)
                         x = jax.image.resize(x, (x.shape[0], 299, 299, 3), method='bilinear', antialias=False)
                         x = 2 * x - 1
@@ -476,7 +467,7 @@ def main(_):
         if not FLAGS.debug_overfit or i == 1:
             batch_images, batch_labels = next(dataset)
             batch_images_sharded, batch_labels_sharded = shard_data(batch_images, batch_labels)
-            if FLAGS.model.use_stable_vae:
+            if FLAGS.config.use_stable_vae:
                 batch_images_sharded = vae_encode(vae_rng, batch_images_sharded)
         
         train_state, update_info = update(train_state, batch_images_sharded, batch_labels_sharded)
