@@ -8,21 +8,21 @@ def modulate(x, shift, scale):
     scale = jnp.clip(scale, -1, 1)
     return x * (1 + scale[:, None]) + shift[:, None]
 
-def fourier_features(rng, num_channels):
-    return 2 * jnp.pi * jax.random.normal(rng, (num_channels,))
+# def fourier_features(rng, num_channels):
+#     return 2 * jnp.pi * jax.random.normal(rng, (num_channels,))
 
-def rope(num_patches_side, dim, theta):
-    img_ids = jnp.zeros(num_patches_side, num_patches_side, 3)
-    img_ids[..., 1] = img_ids[..., 1] + jnp.arange(num_patches_side)[:, None]
-    img_ids[..., 2] = img_ids[..., 2] + jnp.arange(num_patches_side)[None, :]
+# def rope(num_patches_side, dim, theta):
+#     img_ids = jnp.zeros(num_patches_side, num_patches_side, 3)
+#     img_ids[..., 1] = img_ids[..., 1] + jnp.arange(num_patches_side)[:, None]
+#     img_ids[..., 2] = img_ids[..., 2] + jnp.arange(num_patches_side)[None, :]
 
-    assert dim % 2 == 0
-    scale = jnp.arange(0, dim, 2, dtype=jnp.float64) / dim
-    omega = 1.0 / (theta**scale)
-    out = jnp.einsum("...n,d->...nd", pos, omega)
-    out = jnp.stack([jnp.cos(out), -jnp.sin(out), jnp.sin(out), jnp.cos(out)], dim=-1)
-    out = rearrange(out, "b n d (i j) -> b n d i j", i=2, j=2)
-    return out.float()
+#     assert dim % 2 == 0
+#     scale = jnp.arange(0, dim, 2, dtype=jnp.float64) / dim
+#     omega = 1.0 / (theta**scale)
+#     out = jnp.einsum("...n,d->...nd", pos, omega)
+#     out = jnp.stack([jnp.cos(out), -jnp.sin(out), jnp.sin(out), jnp.cos(out)], dim=-1)
+#     out = rearrange(out, "b n d (i j) -> b n d i j", i=2, j=2)
+#     return out.float()
 
 # From https://github.com/young-geng/m3ae_public/blob/master/m3ae/model.py
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):

@@ -21,10 +21,9 @@ class TimestepEmbed(nn.Module):
     @nn.compact
     def __call__(self, t):
         x = self.timestep_embedding(t)
-        # x = nn.Dense(self.hidden_size, nn.initializers.normal(0.02), dtype=self.dtype)(x)
-        x = nn.Dense(self.hidden_size, nn.initializers.lecun_normal(), dtype=self.dtype)(x)
+        x = nn.Dense(self.hidden_size, nn.initializers.normal(0.02), dtype=self.dtype)(x)
         x = nn.silu(x)
-        x = nn.Dense(self.hidden_size, nn.initializers.lecun_normal(), dtype=self.dtype)(x)
+        x = nn.Dense(self.hidden_size, nn.initializers.normal(0.02), dtype=self.dtype)(x)
         return x
 
     # t is between [0, 1].
@@ -80,22 +79,16 @@ class MlpBlock(nn.Module):
     dtype: Dtype
     out_dim: Optional[int] = None
     dropout_rate: float = None
-    kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = nn.initializers.lecun_normal()
-    bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = nn.initializers.constant(0)   
-    # kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = nn.initializers.xavier_uniform()
-    # bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = nn.initializers.normal(stddev=1e-6)
     train: bool = False
 
     @nn.compact
     def __call__(self, inputs):
         """It's just an MLP, so the input shape is (batch, len, emb)."""
         actual_out_dim = inputs.shape[-1] if self.out_dim is None else self.out_dim
-        x = nn.Dense(features=self.mlp_dim, dtype=self.dtype, 
-                     kernel_init=self.kernel_init, bias_init=self.bias_init)(inputs)
+        x = nn.Dense(features=self.mlp_dim, dtype=self.dtype)(inputs)
         x = nn.gelu(x)
         x = nn.Dropout(rate=self.dropout_rate, deterministic=(not self.train))(x)
-        output = nn.Dense(features=actual_out_dim, dtype=self.dtype,
-                     kernel_init=self.kernel_init, bias_init=self.bias_init)(inputs)
+        output = nn.Dense(features=actual_out_dim, dtype=self.dtype)(x)
         output = nn.Dropout(rate=self.dropout_rate, deterministic=(not self.train))(output)
         return output
 

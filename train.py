@@ -205,9 +205,8 @@ def main(_):
             if FLAGS.config['t_conditioning'] == 0:
                 t = jnp.zeros_like(t)
 
-            # labels_dropout = jax.random.bernoulli(label_key, FLAGS.config['class_dropout_prob'], (labels.shape[0],))
-            # labels_dropped = jnp.where(labels_dropout, FLAGS.config['num_classes'], labels)
-            labels_dropped = labels
+            labels_dropout = jax.random.bernoulli(label_key, FLAGS.config['class_dropout_prob'], (labels.shape[0],))
+            labels_dropped = jnp.where(labels_dropout, FLAGS.config['num_classes'], labels)
             
             v_prime, activations = train_state.call_model(x_t, t, labels_dropped,
                                                           train=True, rngs={'dropout': dropout_key}, 
@@ -216,9 +215,9 @@ def main(_):
             
             return loss, {
                 'l2_loss': loss,
-                'v_abs_mean': jnp.abs(v_t).mean(),
-                'v_pred_abs_mean': jnp.abs(v_prime).mean(),
-                **{'activations/' + k : jnp.mean(jnp.abs(v)) for k, v in activations.items()}
+                'v_magnitude_true': jnp.sqrt(jnp.mean(jnp.square(v_t))),
+                'v_magnitude_pred': jnp.sqrt(jnp.mean(jnp.square(v_prime))),
+                **{'activations/' + k : jnp.sqrt(jnp.mean(jnp.square(v))) for k, v in activations.items()}
             }
         
         grads, info = jax.grad(loss_fn, has_aux=True)(train_state.params)
