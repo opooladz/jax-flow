@@ -53,6 +53,7 @@ model_config = ml_collections.ConfigDict({
     'num_heads': 4,
     'mlp_ratio': 4,
     'dropout': 0.0,
+    'parallel_block': 0,
     'class_dropout_prob': 0.1,
     'num_classes': 1000,
     'denoise_timesteps': 32,
@@ -131,6 +132,7 @@ def main(_):
         'class_dropout_prob': FLAGS.model['class_dropout_prob'],
         'num_classes': FLAGS.model['num_classes'],
         'dropout': FLAGS.model['dropout'],
+        'parallel_block': FLAGS.model['parallel_block'],
     }
     model_def = DiT(**dit_args)
     tabulate_fn = flax.linen.tabulate(model_def, jax.random.PRNGKey(0))

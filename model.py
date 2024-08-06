@@ -184,6 +184,7 @@ class DiTBlock(nn.Module):
     hidden_size: int
     num_heads: int
     dtype: Dtype
+    parallel_block: bool = False
     mlp_ratio: float = 4.0
     dropout: float = 0.0
     train: bool = False
@@ -192,34 +193,57 @@ class DiTBlock(nn.Module):
     @nn.compact
     def __call__(self, x, c):
         # Calculate adaLn modulation parameters.
-        c = nn.silu(c)
-        c = nn.Dense(6 * self.hidden_size, kernel_init=nn.initializers.constant(0.), dtype=self.dtype)(c)
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(c, 6, axis=-1)
-        
-        # Attention Residual.
-        x_norm = nn.LayerNorm(use_bias=False, use_scale=False, dtype=self.dtype)(x)
-        x_modulated = modulate(x_norm, shift_msa, scale_msa)
-        channels_per_head = self.hidden_size // self.num_heads
-        k = nn.Dense(self.hidden_size)(x_modulated)
-        q = nn.Dense(self.hidden_size)(x_modulated)
-        v = nn.Dense(self.hidden_size)(x_modulated)
-        k = jnp.reshape(k, (k.shape[0], k.shape[1], self.num_heads, channels_per_head))
-        q = jnp.reshape(q, (q.shape[0], q.shape[1], self.num_heads, channels_per_head))
-        v = jnp.reshape(v, (v.shape[0], v.shape[1], self.num_heads, channels_per_head))
-        q = q / jnp.sqrt(q.shape[3]) # (1/d) scaling.
-        w = jnp.einsum('bqhc,bkhc->bhqk', q, k) # [B, HW, HW, num_heads]
-        w = nn.softmax(w, axis=-1)
-        y = jnp.einsum('bhqk,bkhc->bqhc', w, v) # [B, HW, num_heads, channels_per_head]
-        y = jnp.reshape(y, x.shape) # [B, H, W, C] (C = heads * channels_per_head)
-        attn_x = nn.Dense(self.hidden_size)(y)
-        x = x + (gate_msa[:, None] * attn_x)
+        if not self.parallel_block:
+            c = nn.silu(c)
+            c = nn.Dense(6 * self.hidden_size, kernel_init=nn.initializers.constant(0.), dtype=self.dtype)(c)
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(c, 6, axis=-1)
 
-        # MLP Residual.
-        x_norm2 = nn.LayerNorm(use_bias=False, use_scale=False, dtype=self.dtype)(x)
-        x_modulated2 = modulate(x_norm2, shift_mlp, scale_mlp)
-        mlp_x = MlpBlock(mlp_dim=int(self.hidden_size * self.mlp_ratio),
-                         dtype=self.dtype, dropout_rate=self.dropout, train=self.train)(x_modulated2)
-        x = x + (gate_mlp[:, None] * mlp_x)
+          # Attention Residual.
+            x_norm = nn.LayerNorm(use_bias=False, use_scale=False, dtype=self.dtype)(x)
+            x_modulated = modulate(x_norm, shift_msa, scale_msa)
+            channels_per_head = self.hidden_size // self.num_heads
+            k = nn.Dense(self.hidden_size, dtype=self.dtype)(x_modulated)
+            q = nn.Dense(self.hidden_size, dtype=self.dtype)(x_modulated)
+            v = nn.Dense(self.hidden_size, dtype=self.dtype)(x_modulated)
+            k = jnp.reshape(k, (k.shape[0], k.shape[1], self.num_heads, channels_per_head))
+            q = jnp.reshape(q, (q.shape[0], q.shape[1], self.num_heads, channels_per_head))
+            v = jnp.reshape(v, (v.shape[0], v.shape[1], self.num_heads, channels_per_head))
+            q = q / jnp.sqrt(q.shape[3]) # (1/d) scaling.
+            w = jnp.einsum('bqhc,bkhc->bhqk', q, k) # [B, HW, HW, num_heads]
+            w = nn.softmax(w, axis=-1)
+            y = jnp.einsum('bhqk,bkhc->bqhc', w, v) # [B, HW, num_heads, channels_per_head]
+            y = jnp.reshape(y, x.shape) # [B, H, W, C] (C = heads * channels_per_head)
+            attn_x = nn.Dense(self.hidden_size, dtype=self.dtype)(y)
+            x = x + (gate_msa[:, None] * attn_x)
+
+            # MLP Residual.
+            x_norm2 = nn.LayerNorm(use_bias=False, use_scale=False, dtype=self.dtype)(x)
+            x_modulated2 = modulate(x_norm2, shift_mlp, scale_mlp)
+            mlp_x = MlpBlock(mlp_dim=int(self.hidden_size * self.mlp_ratio),
+                            dtype=self.dtype, dropout_rate=self.dropout, train=self.train)(x_modulated2)
+            x = x + (gate_mlp[:, None] * mlp_x)
+        else:
+            c = nn.silu(c)
+            c = nn.Dense(3 * self.hidden_size, kernel_init=nn.initializers.constant(0.), dtype=self.dtype)(c)
+            shift, scale, gate = jnp.split(c, 3, axis=-1)
+            # Parallel block.
+            x_norm = nn.LayerNorm(use_bias=False, use_scale=False, dtype=self.dtype)(x)
+            x_modulated = modulate(x_norm, shift, scale)
+            qkv_mlp = nn.Dense(self.hidden_size * (3 + self.mlp_ratio), dtype=self.dtype)(x_modulated)
+            q, k, v, mlp = jnp.split(qkv_mlp, [self.hidden_size, self.hidden_size*2, self.hidden_size*3], axis=-1)
+            channels_per_head = self.hidden_size // self.num_heads
+            q = jnp.reshape(q, (q.shape[0], q.shape[1], self.num_heads, channels_per_head))
+            k = jnp.reshape(k, (k.shape[0], k.shape[1], self.num_heads, channels_per_head))
+            v = jnp.reshape(v, (v.shape[0], v.shape[1], self.num_heads, channels_per_head))
+            q = q / jnp.sqrt(q.shape[3]) # (1/d) scaling.
+            w = jnp.einsum('bqhc,bkhc->bhqk', q, k) # [B, HW, HW, num_heads]
+            w = nn.softmax(w, axis=-1)
+            y = jnp.einsum('bhqk,bkhc->bqhc', w, v) # [B, HW, num_heads, channels_per_head]
+            y = jnp.reshape(y, x.shape) # [B, H, W, C] (C = heads * channels_per_head)
+            attn_x = y
+
+            residual = nn.Dense(self.hidden_size, dtype=self.dtype)(jnp.concatenate([mlp, attn_x], axis=-1))
+            x = x + (gate[:, None] * residual)
         return x
     
 class FinalLayer(nn.Module):
@@ -254,6 +278,7 @@ class DiT(nn.Module):
     mlp_ratio: float
     class_dropout_prob: float
     num_classes: int
+    parallel_block: bool
     dropout: float = 0.0
     dtype: Dtype = jnp.bfloat16
 
@@ -291,7 +316,7 @@ class DiT(nn.Module):
         print("DiT: Patch Embed of shape", x.shape, "dtype", x.dtype)
         print("DiT: Conditioning of shape", c.shape, "dtype", c.dtype)
         for i in range(self.depth):
-            x = DiTBlock(self.hidden_size, self.num_heads, self.dtype, self.mlp_ratio, self.dropout, train)(x, c)
+            x = DiTBlock(self.hidden_size, self.num_heads, self.dtype, self.parallel_block, self.mlp_ratio, self.dropout, train)(x, c)
             activations[f'dit_block_{i}'] = x
             print("DiT: DiTBlock of shape", x.shape, "dtype", x.dtype)
         x = FinalLayer(self.patch_size, out_channels, self.hidden_size, dtype=self.dtype)(x, c) # (B, num_patches, p*p*c)
