@@ -5,6 +5,7 @@ import flax.linen as nn
 from einops import rearrange, repeat
 
 def modulate(x, shift, scale):
+    scale = jnp.clip(scale, -1, 1)
     return x * (1 + scale[:, None]) + shift[:, None]
 
 def fourier_features(rng, num_channels):

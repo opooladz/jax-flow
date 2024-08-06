@@ -205,8 +205,9 @@ def main(_):
             if FLAGS.config['t_conditioning'] == 0:
                 t = jnp.zeros_like(t)
 
-            labels_dropout = jax.random.bernoulli(label_key, FLAGS.config['class_dropout_prob'], (labels.shape[0],))
-            labels_dropped = jnp.where(labels_dropout, FLAGS.config['num_classes'], labels)
+            # labels_dropout = jax.random.bernoulli(label_key, FLAGS.config['class_dropout_prob'], (labels.shape[0],))
+            # labels_dropped = jnp.where(labels_dropout, FLAGS.config['num_classes'], labels)
+            labels_dropped = labels
             
             v_prime, activations = train_state.call_model(x_t, t, labels_dropped,
                                                           train=True, rngs={'dropout': dropout_key}, 

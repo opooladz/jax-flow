@@ -21,9 +21,10 @@ class TimestepEmbed(nn.Module):
     @nn.compact
     def __call__(self, t):
         x = self.timestep_embedding(t)
-        x = nn.Dense(self.hidden_size, nn.initializers.normal(0.02), dtype=self.dtype)(x)
+        # x = nn.Dense(self.hidden_size, nn.initializers.normal(0.02), dtype=self.dtype)(x)
+        x = nn.Dense(self.hidden_size, nn.initializers.lecun_normal(), dtype=self.dtype)(x)
         x = nn.silu(x)
-        x = nn.Dense(self.hidden_size, nn.initializers.normal(0.02), dtype=self.dtype)(x)
+        x = nn.Dense(self.hidden_size, nn.initializers.lecun_normal(), dtype=self.dtype)(x)
         return x
 
     # t is between [0, 1].
@@ -67,7 +68,7 @@ class PatchEmbed(nn.Module):
         patch_tuple = (self.patch_size, self.patch_size)
         num_patches = (H // self.patch_size)
         x = nn.Conv(self.hidden_size, patch_tuple, patch_tuple, use_bias=self.bias, padding="VALID",
-                     kernel_init=nn.initializers.xavier_uniform(), 
+                     kernel_init=nn.initializers.lecun_normal(), 
                      dtype=self.dtype)(x) # (B, P, P, hidden_size)
         x = rearrange(x, 'b h w c -> b (h w) c', h=num_patches, w=num_patches)
         return x
@@ -79,8 +80,10 @@ class MlpBlock(nn.Module):
     dtype: Dtype
     out_dim: Optional[int] = None
     dropout_rate: float = None
-    kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = nn.initializers.xavier_uniform()
-    bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = nn.initializers.normal(stddev=1e-6)
+    kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = nn.initializers.lecun_normal()
+    bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = nn.initializers.constant(0)   
+    # kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = nn.initializers.xavier_uniform()
+    # bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = nn.initializers.normal(stddev=1e-6)
     train: bool = False
 
     @nn.compact
