@@ -149,10 +149,10 @@ def main(_):
 
     lr = FLAGS.model['lr'] if FLAGS.model.warmup == 0 else optax.linear_schedule(0.0, FLAGS.model['lr'], FLAGS.model['warmup'])
     adam = optax.adamw(learning_rate=lr, b1=FLAGS.model['beta1'], b2=FLAGS.model['beta2'], weight_decay=FLAGS.model['weight_decay'])
-    if FLAGS.model.use_spectral_norm:
-        tx = optax.chain(adam, scale_spectral_norm())
-    else:
-        tx = optax.chain(adam)
+    # if FLAGS.model.use_spectral_norm:
+    #     tx = optax.chain(adam, scale_spectral_norm())
+    # else:
+    tx = optax.chain(adam)
     
     def init(rng):
         param_key, dropout_key, dropout2_key = jax.random.split(rng, 3)

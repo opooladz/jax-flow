@@ -75,10 +75,9 @@ class TimestepEmbedder(nn.Module):
     @nn.compact
     def __call__(self, t):
         x = self.timestep_embedding(t)
-        x = nn.Dense(self.hidden_size, kernel_init=self.kernel_init(lr_scale=self.lr_scale), 
-                     bias_init=self.kernel_init(init_scale=0, lr_scale=self.lr_scale), dtype=self.dtype)(x)
+        x = nn.Dense(self.hidden_size, dtype=self.dtype)(x)
         x = nn.silu(x)
-        x = nn.Dense(self.hidden_size, kernel_init=self.kernel_init(), bias_init=self.kernel_init(0), dtype=self.dtype)(x)
+        x = nn.Dense(self.hidden_size, dtype=self.dtype)(x)
         return x
 
     # t is between [0, 1].
@@ -150,8 +149,7 @@ class PatchEmbed(nn.Module):
         patch_tuple = (self.patch_size, self.patch_size)
         num_patches = (H // self.patch_size)
         x = nn.Conv(self.hidden_size, patch_tuple, patch_tuple, use_bias=self.bias, padding="VALID",
-                     kernel_init=self.kernel_init(lr_scale=self.lr_scale), 
-                     bias_init=self.kernel_init(init_scale=0, lr_scale=self.lr_scale), 
+                     kernel_init=nn.initializers.lecun_normal(), 
                      dtype=self.dtype)(x) # (B, P, P, hidden_size)
         x = rearrange(x, 'b h w c -> b (h w) c', h=num_patches, w=num_patches)
         return x
@@ -170,12 +168,10 @@ class MlpBlock(nn.Module):
     def __call__(self, inputs):
         """It's just an MLP, so the input shape is (batch, len, emb)."""
         actual_out_dim = inputs.shape[-1] if self.out_dim is None else self.out_dim
-        x = nn.Dense(features=self.mlp_dim, dtype=self.dtype, 
-                     kernel_init=self.kernel_init(), bias_init=self.kernel_init(0))(inputs)
+        x = nn.Dense(features=self.mlp_dim, dtype=self.dtype)(inputs)
         x = nn.gelu(x)
         x = nn.Dropout(rate=self.dropout_rate, deterministic=(not self.train))(x)
-        output = nn.Dense(features=actual_out_dim, dtype=self.dtype,
-                kernel_init=self.kernel_init(), bias_init=self.kernel_init(0))(x)
+        output = nn.Dense(features=actual_out_dim, dtype=self.dtype)(x)
         output = nn.Dropout(rate=self.dropout_rate, deterministic=(not self.train))(output)
         return output
     
@@ -204,16 +200,16 @@ class DiTBlock(nn.Module):
     def __call__(self, x, c):
         # Calculate adaLn modulation parameters.
         c = nn.silu(c)
-        c = nn.Dense(6 * self.hidden_size, kernel_init=self.kernel_init(0), bias_init=self.kernel_init(0), dtype=self.dtype)(c)
+        c = nn.Dense(6 * self.hidden_size, kernel_init=nn.initializers.zeros_init(), dtype=self.dtype)(c)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(c, 6, axis=-1)
         
         # Attention Residual.
         x_norm = nn.LayerNorm(use_bias=False, use_scale=False, dtype=self.dtype)(x)
         x_modulated = modulate(x_norm, shift_msa, scale_msa)
         channels_per_head = self.hidden_size // self.num_heads
-        k = nn.Dense(self.hidden_size, kernel_init=self.kernel_init(), bias_init=self.kernel_init(0))(x_modulated)
-        q = nn.Dense(self.hidden_size, kernel_init=self.kernel_init(), bias_init=self.kernel_init(0))(x_modulated)
-        v = nn.Dense(self.hidden_size, kernel_init=self.kernel_init(), bias_init=self.kernel_init(0))(x_modulated)
+        k = nn.Dense(self.hidden_size)(x_modulated)
+        q = nn.Dense(self.hidden_size)(x_modulated)
+        v = nn.Dense(self.hidden_size)(x_modulated)
         k = jnp.reshape(k, (k.shape[0], k.shape[1], self.num_heads, channels_per_head))
         q = jnp.reshape(q, (q.shape[0], q.shape[1], self.num_heads, channels_per_head))
         v = jnp.reshape(v, (v.shape[0], v.shape[1], self.num_heads, channels_per_head))
@@ -222,7 +218,7 @@ class DiTBlock(nn.Module):
         w = nn.softmax(w, axis=-1)
         y = jnp.einsum('bhqk,bkhc->bqhc', w, v) # [B, HW, num_heads, channels_per_head]
         y = jnp.reshape(y, x.shape) # [B, H, W, C] (C = heads * channels_per_head)
-        attn_x = nn.Dense(self.hidden_size, kernel_init=self.kernel_init(), bias_init=self.kernel_init(0))(y)
+        attn_x = nn.Dense(self.hidden_size)(y)
         x = x + (gate_msa[:, None] * attn_x)
 
         # MLP Residual.
@@ -248,13 +244,12 @@ class FinalLayer(nn.Module):
     def __call__(self, x, c):
         acts = []
         c = nn.silu(c)
-        c = nn.Dense(2 * self.hidden_size, kernel_init=self.kernel_init(0), bias_init=self.kernel_init(0), dtype=self.dtype)(c)
+        c = nn.Dense(2 * self.hidden_size, kernel_init=nn.initializers.zeros_init(), dtype=self.dtype)(c)
         shift, scale = jnp.split(c, 2, axis=-1)
         x = nn.LayerNorm(use_bias=False, use_scale=False, dtype=self.dtype)(x)
         x = modulate(x, shift, scale)
         x = nn.Dense(self.patch_size * self.patch_size * self.out_channels, 
-                     kernel_init=self.kernel_init(init_scale=0, lr_scale=self.lr_scale), 
-                     bias_init=self.kernel_init(init_scale=0, lr_scale=self.lr_scale), dtype=self.dtype)(x)
+                     kernel_init=nn.initializers.zeros_init(), dtype=self.dtype)(x)
         return x
 
 class DiT(nn.Module):
