@@ -43,17 +43,17 @@ flags.DEFINE_integer('debug_overfit', 0, 'Debug overfitting.')
 
 model_config = ml_collections.ConfigDict({
     # Make sure to run with Large configs when we actually want to run!
-    'lr': 0.0002,
-    'lr_scale_patch': 1.0,
-    'lr_scale_embed': 1.0,
+    'lr': 0.3,
+    'lr_scale_patch': 0.01,
+    'lr_scale_embed': 0.1,
     'lr_scale_final': 1.0,
     'lr_scale_time': 1.0,
-    'lr_scale_bias': 1.0,
+    'lr_scale_bias': 0.01,
     'beta1': 0.9,
     'beta2': 0.999,
     'weight_decay': 0.0,
     'warmup': 0,
-    'use_spectral_norm': 0,
+    'use_spectral_norm': 1,
     'hidden_size': 64, 
     'patch_size': 2, 
     'depth': 4,

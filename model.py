@@ -253,7 +253,7 @@ class DiT(nn.Module):
         t = TimestepEmbedder(self.hidden_size, tc=tc)(t) # (B, hidden_size)
         y = LabelEmbedder(self.num_classes, self.hidden_size, tc=tc)(y) # (B, hidden_size)
         c = t + y
-        c = nn.LayerNorm(use_bias=False, use_scale=False, dtype=self.dtype)(c)
+        # c = nn.LayerNorm(use_bias=False, use_scale=False, dtype=self.dtype)(c)
         
         activations['pos_embed'] = pos_embed
         activations['time_embed'] = t
