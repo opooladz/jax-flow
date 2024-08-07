@@ -43,16 +43,17 @@ flags.DEFINE_integer('debug_overfit', 0, 'Debug overfitting.')
 
 model_config = ml_collections.ConfigDict({
     # Make sure to run with Large configs when we actually want to run!
-    'lr': 0.05,
+    'lr': 0.0002,
     'lr_scale_patch': 1.0,
     'lr_scale_embed': 1.0,
     'lr_scale_final': 1.0,
     'lr_scale_time': 1.0,
+    'lr_scale_bias': 1.0,
     'beta1': 0.9,
     'beta2': 0.999,
     'weight_decay': 0.0,
     'warmup': 0,
-    'use_spectral_norm': 1,
+    'use_spectral_norm': 0,
     'hidden_size': 64, 
     'patch_size': 2, 
     'depth': 4,
@@ -142,6 +143,7 @@ def main(_):
         'lr_scale_embed': FLAGS.model['lr_scale_embed'],
         'lr_scale_final': FLAGS.model['lr_scale_final'],
         'lr_scale_time': FLAGS.model['lr_scale_time'],
+        'lr_scale_bias': FLAGS.model['lr_scale_bias'],
     }
     model_def = DiT(**dit_args)
     tabulate_fn = flax.linen.tabulate(model_def, jax.random.PRNGKey(0))
@@ -228,17 +230,20 @@ def main(_):
 
             if FLAGS.model['t_conditioning'] == 0:
                 t = jnp.zeros_like(t)
+
+            labels_dropout = jax.random.bernoulli(label_key, FLAGS.model['class_dropout_prob'], (labels.shape[0],))
+            labels_dropped = jnp.where(labels_dropout, FLAGS.model['num_classes'], labels)
             
-            rngs = {'label_dropout': label_key, 'dropout': dropout_key}
-            v_prime, activations = train_state.call_model(x_t, t, labels, train=True, rngs=rngs, 
+            v_prime, activations = train_state.call_model(x_t, t, labels_dropped, 
+                                                          train=True, rngs={'dropout': dropout_key}, 
                                                           params=grad_params, return_activations=True)
             loss = jnp.mean((v_prime - v_t) ** 2)
             
             return loss, {
                 'l2_loss': loss,
-                'v_abs_mean': jnp.abs(v_t).mean(),
-                'v_pred_abs_mean': jnp.abs(v_prime).mean(),
-                **{'activations/' + k : jnp.mean(jnp.abs(v)) for k, v in activations.items()}
+                'v_magnitude_true': jnp.sqrt(jnp.mean(jnp.square(v_t))),
+                'v_magnitude_pred': jnp.sqrt(jnp.mean(jnp.square(v_prime))),
+                **{'activations/' + k : jnp.sqrt(jnp.mean(jnp.square(v))) for k, v in activations.items()}
             }
         
         grads, info = jax.grad(loss_fn, has_aux=True)(train_state.params)
@@ -290,11 +295,11 @@ def main(_):
             def call_model(train_state, images, t, labels, use_cfg, cfg_scale):
                 print("Call_model with shapes", images.shape, t.shape, labels.shape)
                 if not use_cfg:
-                    return train_state.call_model_eps(images, t, labels, train=False, force_drop_ids=False)
+                    return train_state.call_model_eps(images, t, labels, train=False)
                 else:
                     labels_uncond = jnp.ones(labels.shape, dtype=jnp.int32) * FLAGS.model['num_classes'] # Null token
-                    v_pred_uncond = train_state.call_model_eps(images, t, labels_uncond, train=False, force_drop_ids=False)
-                    v_pred_label = train_state.call_model_eps(images, t, labels, train=False, force_drop_ids=False)
+                    v_pred_uncond = train_state.call_model_eps(images, t, labels_uncond, train=False)
+                    v_pred_label = train_state.call_model_eps(images, t, labels, train=False)
                     v = v_pred_uncond + cfg_scale * (v_pred_label - v_pred_uncond)
                     return v
 
