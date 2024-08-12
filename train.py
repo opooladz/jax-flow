@@ -503,6 +503,14 @@ def main(_):
             update_info = jax.tree_map(lambda x: x.mean(), update_info)
             train_metrics = {f'training/{k}': v for k, v in update_info.items()}
 
+            valid_images, valid_labels = shard_data(*next(dataset_valid))
+            if FLAGS.model.use_stable_vae:
+                valid_images = vae_encode(vae_rng, valid_images)
+            _, valid_update_info = update(train_state, valid_images, valid_labels)
+            valid_update_info = jax.device_get(valid_update_info)
+            valid_update_info = jax.tree_map(lambda x: x.mean(), valid_update_info)
+            train_metrics['training/valid_l2_loss'] = valid_update_info['l2_loss']
+
             if jax.process_index() == 0:
                 print(train_metrics)
                 wandb.log(train_metrics, step=i)

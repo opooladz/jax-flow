@@ -44,8 +44,29 @@ def get_dataset(dataset_name, batch_size, is_train, debug_overfit=False):
             image = (image - 0.5) / 0.5 # Normalize to [-1, 1]
             return image,  data['label']
 
-        split = tfds.split_for_jax_process('train', drop_remainder=True)
+        split = tfds.split_for_jax_process('train[:90%]' if is_train else 'train[90%:]', drop_remainder=True)
         dataset = tfds.load('celebahq256', split=split)
+        dataset = dataset.map(deserialization_fn, num_parallel_calls=tf.data.AUTOTUNE)
+        dataset = dataset.shuffle(10000, seed=42, reshuffle_each_iteration=True)
+        dataset = dataset.repeat()
+        dataset = dataset.batch(batch_size)
+        dataset = dataset.prefetch(tf.data.AUTOTUNE)
+        dataset = tfds.as_numpy(dataset)
+        dataset = iter(dataset)
+        return dataset
+    elif dataset_name == 'lsunchurch':
+        def deserialization_fn(data):
+            image = data['image']
+            min_side = tf.minimum(tf.shape(image)[0], tf.shape(image)[1])
+            image = tf.image.resize_with_crop_or_pad(image, min_side, min_side)
+            image = tf.image.resize(image, (256, 256), antialias=True)
+            image = tf.cast(image, tf.float32)
+            image = image / 255.0
+            image = (image - 0.5) / 0.5 # Normalize to [-1, 1]
+            return image, 0 # No label
+
+        split = tfds.split_for_jax_process('church-train' if is_train else 'church-test', drop_remainder=True)
+        dataset = tfds.load('lsunc', split=split)
         dataset = dataset.map(deserialization_fn, num_parallel_calls=tf.data.AUTOTUNE)
         dataset = dataset.shuffle(10000, seed=42, reshuffle_each_iteration=True)
         dataset = dataset.repeat()
