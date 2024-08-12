@@ -25,7 +25,7 @@ from utils.checkpoint import Checkpoint
 from utils.stable_vae import StableVAE
 from utils.sharding import create_sharding
 from utils.datasets import get_dataset
-from utils.spectral_optimizer import spectral_init, scale_spectral_norm
+from utils.spectral_optimizer import scale_spectral_norm
 from model import DiT
 
 FLAGS = flags.FLAGS
@@ -42,10 +42,10 @@ flags.DEFINE_integer('max_steps', int(1_000_000), 'Number of training steps.')
 flags.DEFINE_integer('debug_overfit', 0, 'Debug overfitting.')
 
 model_config = ml_collections.ConfigDict({
-    # Make sure to run with Large configs when we actually want to run!
     'lr': 0.3,
+    'use_spectral_norm': 1,
     'lr_scale_patch': 0.01,
-    'lr_scale_embed': 0.1,
+    'lr_scale_embed': 0.01,
     'lr_scale_final': 1.0,
     'lr_scale_time': 1.0,
     'lr_scale_bias': 0.01,
@@ -53,7 +53,6 @@ model_config = ml_collections.ConfigDict({
     'beta2': 0.999,
     'weight_decay': 0.0,
     'warmup': 0,
-    'use_spectral_norm': 1,
     'hidden_size': 64, 
     'patch_size': 2, 
     'depth': 4,

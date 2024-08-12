@@ -242,8 +242,9 @@ class DiT(nn.Module):
         out_channels = in_channels
         num_patches = (input_size // self.patch_size) ** 2
         num_patches_side = input_size // self.patch_size
-        pos_embed = self.param("pos_embed", get_2d_sincos_pos_embed, self.hidden_size, num_patches)
-        pos_embed = jax.lax.stop_gradient(pos_embed)
+        # pos_embed = self.param("pos_embed", get_2d_sincos_pos_embed, self.hidden_size, num_patches)
+        # pos_embed = jax.lax.stop_gradient(pos_embed)
+        pos_embed = get_2d_sincos_pos_embed(None, self.hidden_size, num_patches)
         x = PatchEmbed(self.patch_size, self.hidden_size, tc=tc)(x) # (B, num_patches, hidden_size)
         print("DiT: After patch embed, shape is", x.shape, "dtype", x.dtype)
         activations['patch_embed'] = x
