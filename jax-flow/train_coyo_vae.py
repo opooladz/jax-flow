@@ -10,10 +10,10 @@ QUICK_TEST = "--test" in sys.argv
 if QUICK_TEST:
     print("Running in TEST mode with minimal settings...")
     config = {
-        "batch_size": 4,
-        "image_size": 256,
+        "batch_size": 8,  # Minimum for 8 TPU cores
+        "image_size": 64,  # Small for testing
         "max_steps": 10,
-        "use_vae": True,
+        "use_vae": False,  # Skip VAE for quick test
         "model_preset": "debug",
         "log_interval": 1,
     }
