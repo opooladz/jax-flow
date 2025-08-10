@@ -39,7 +39,7 @@ cmd = [
     "--log_interval", str(config["log_interval"]),
     "--save_interval", "10000",
     "--model.preset", config["model_preset"],
-    "--model.use_stable_vae", "1" if config["use_vae"] else "0",
+    "--use_stable_vae", "1" if config["use_vae"] else "0",
     "--wandb.project", "coyo_vae_flow",
     "--wandb.name", f"coyo_{'test' if QUICK_TEST else 'full'}",
 ]

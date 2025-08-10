@@ -38,6 +38,7 @@ flags.DEFINE_integer('save_interval', 10000, 'Save interval.')
 flags.DEFINE_integer('batch_size', 32, 'Batch size.')
 flags.DEFINE_integer('max_steps', int(100_000), 'Number of training steps.')
 flags.DEFINE_integer('image_size', 256, 'Image size.')
+flags.DEFINE_integer('use_stable_vae', 0, 'Use Stable Diffusion VAE for latent space.')
 
 flags.DEFINE_integer('debug_overfit', 0, 'Debug overfitting on small dataset.')
 
@@ -237,14 +238,35 @@ def main(_):
 
     # Create dataset
     print("Loading dataset:", FLAGS.dataset_name)
-    train_loader = create_text_image_dataloader(
-        dataset_name=FLAGS.dataset_name,
-        batch_size=local_batch_size,
-        image_size=FLAGS.image_size,
-        split="train",
-        streaming=True,
-        seed=FLAGS.seed
-    )
+    
+    if FLAGS.dataset_name == "coyo":
+        # Use COYO-700M with VAE
+        from utils.coyo_dataset import create_coyo_dataloader
+        train_loader = create_coyo_dataloader(
+            batch_size=local_batch_size,
+            image_size=FLAGS.image_size,
+            use_vae=FLAGS.use_stable_vae == 1,
+            streaming=True,
+        )
+    elif FLAGS.dataset_name == "mock":
+        # Use mock dataset for testing
+        from utils.text_image_datasets_mock import create_mock_dataloader
+        train_loader = create_mock_dataloader(
+            batch_size=local_batch_size,
+            image_size=FLAGS.image_size,
+            text_embed_dim=768 if FLAGS.use_stable_vae else 384,
+        )
+    else:
+        # Use generic text-image dataset
+        from utils.text_image_datasets import create_text_image_dataloader
+        train_loader = create_text_image_dataloader(
+            dataset_name=FLAGS.dataset_name,
+            batch_size=local_batch_size,
+            image_size=FLAGS.image_size,
+            split="train",
+            streaming=True,
+            seed=FLAGS.seed
+        )
     
     # Get example batch for model initialization
     print("Getting example batch...")
