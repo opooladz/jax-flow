@@ -26,7 +26,7 @@ class COYO700MDataset:
         shuffle_buffer_size: int = 1000,
         seed: int = 42,
         use_vae: bool = True,  # Use SD-VAE for latent space
-        vae_model: str = "stabilityai/sd-vae-ft-mse",  # Best VAE for training
+        vae_model: str = "pcuenq/sd-vae-ft-mse-flax",  # Flax VAE for training
         text_encoder: str = "openai/clip-vit-large-patch14",  # Larger CLIP
         max_text_length: int = 77,
         num_workers: int = 4,  # Parallel image downloading
@@ -45,8 +45,7 @@ class COYO700MDataset:
         # Initialize VAE if using latent space
         if self.use_vae:
             print(f"Loading VAE: {vae_model}")
-            self.vae = FlaxAutoencoderKL.from_pretrained(vae_model, dtype=jnp.float32)
-            self.vae_params = self.vae.params
+            self.vae, self.vae_params = FlaxAutoencoderKL.from_pretrained(vae_model, dtype=jnp.float32)
             self.latent_dim = 4  # SD-VAE has 4 latent channels
             # VAE downscales by 8x
             self.latent_size = image_size // 8
@@ -58,7 +57,11 @@ class COYO700MDataset:
         # Initialize CLIP text encoder
         print(f"Loading CLIP text encoder: {text_encoder}")
         self.tokenizer = CLIPTokenizer.from_pretrained(text_encoder)
-        self.text_encoder = FlaxCLIPTextModel.from_pretrained(text_encoder)
+        # Load only text encoder (vision weights will be ignored - this is expected)
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Some weights of the model checkpoint")
+            self.text_encoder = FlaxCLIPTextModel.from_pretrained(text_encoder)
         self.text_embed_dim = self.text_encoder.config.hidden_size
         print(f"CLIP loaded. Text embedding dim: {self.text_embed_dim}")
         
@@ -128,6 +131,8 @@ class COYO700MDataset:
         if self.use_vae:
             # Encode with VAE to latent space
             image = image[None, ...]  # Add batch dimension
+            # VAE expects channels-first: (batch, channels, height, width)
+            image = np.transpose(image, (0, 3, 1, 2))
             image_jax = jnp.array(image)
             
             # Encode to latent
@@ -141,6 +146,9 @@ class COYO700MDataset:
             
             # Scale by VAE scaling factor
             latent = latent * 0.18215  # SD-VAE scaling
+            
+            # VAE already outputs in channels-last format (batch, height, width, channels)
+            # No need to transpose!
             
             return np.array(latent[0])  # Remove batch dimension
         else:
@@ -179,8 +187,7 @@ class COYO700MDataset:
             return None
         
         # Download images in parallel
-        with self.executor as executor:
-            images = list(executor.map(self._download_image, urls))
+        images = list(self.executor.map(self._download_image, urls))
         
         # Process valid images
         processed_images = []
@@ -243,6 +250,11 @@ class COYO700MDataset:
             # Reload dataset for next epoch
             if self.streaming:
                 self._load_dataset()
+    
+    def __del__(self):
+        """Cleanup executor on deletion."""
+        if hasattr(self, 'executor'):
+            self.executor.shutdown(wait=False)
 
 
 def create_coyo_dataloader(

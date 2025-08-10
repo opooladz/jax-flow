@@ -4,108 +4,115 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a JAX implementation of flow-matching models (Rectified Flow), which are a type of generative model similar to diffusion models. The implementation is based on the Diffusion Transformer (DiT) architecture and supports training on image datasets like ImageNet256 and CelebAHQ256.
+JAX implementation of flow-matching models (Rectified Flow) - generative models similar to diffusion models but with straight trajectories between noise and data. Built on the Diffusion Transformer (DiT) architecture with support for both pixel-space and latent-space (VAE) training.
 
 ## Key Commands
 
 ### Training
 
-Train flow-matching models with different configurations:
-
-#### HuggingFace Datasets (New)
 ```bash
-# Train on CIFAR-10
-python train_flow.py --dataset_name cifar10 --batch_size 128 --model.preset big --model.patch_size 8 --model.use_stable_vae 0
+# Quick test with debug preset
+python train_flow.py --dataset_name cifar10 --model.preset debug --max_steps 100
 
-# Train on TinyImageNet  
+# HuggingFace Datasets (streaming, no storage needed)
+python train_flow.py --dataset_name cifar10 --batch_size 128 --model.preset big --model.patch_size 8 --model.use_stable_vae 0
+python train_flow.py --dataset_name cifar100 --batch_size 128 --model.preset big --model.patch_size 8 --model.use_stable_vae 0
 python train_flow.py --dataset_name tiny-imagenet --batch_size 64 --model.preset big --model.patch_size 8 --model.use_stable_vae 0
 
-# Or use the provided script
-./train_tiny_imagenet.sh
-```
+# TensorFlow Datasets (requires TFDS preparation)
+python train_flow.py --dataset_name imagenet256 --model.preset big --batch_size 512 --model.patch_size 2
+python train_flow.py --dataset_name celebahq256 --model.preset big --batch_size 512 --model.patch_size 2
 
-#### Original TensorFlow Datasets
-
-```bash
-# DiT-B on ImageNet256 with Stable Diffusion VAE (latent space)
-python train_flow.py --dataset_name imagenet256 --wandb.name DiT-B --model.depth 12 --model.hidden_size 768 --model.patch_size 2 --model.num_heads 16 --model.mlp_ratio 4 --batch_size 512
-
-# DiT-B on CelebAHQ256 with Stable Diffusion VAE (latent space)
-python train_flow.py --dataset_name celebahq256 --wandb.name DiT-B-CelebA --model.depth 12 --model.hidden_size 768 --model.patch_size 2 --model.num_heads 16 --model.mlp_ratio 4 --batch_size 512
-
-# DiT-B on CelebAHQ256 in pixel space (no VAE)
-python train_flow.py --dataset_name celebahq256 --wandb.name DiT-B-CelebAPixel --model.depth 12 --model.hidden_size 768 --model.patch_size 8 --model.num_heads 16 --model.mlp_ratio 4 --batch_size 512 --use_stable_vae 0
+# TPU training
+./setup_tpu.sh  # One-time setup
+./train_tpu.sh  # Run training with optimized settings
 ```
 
 ### Evaluation
 
-Evaluate FID (Fréchet Inception Distance) on trained models:
-
 ```bash
-python eval_fid.py --load_dir [checkpoint_dir] --dataset_name imagenet256 --fid_stats data/imagenet256_fidstats_openai.npz --cfg_scale 4 --denoise_timesteps 500
+# FID evaluation
+python eval_fid.py --load_dir [checkpoint_dir] --dataset_name [dataset] --cfg_scale 4 --denoise_timesteps 500
+
+# Test dataset loading
+python quick_test.py      # Test HF dataset streaming
+python test_cifar10.py    # Test CIFAR-10 specifically
+python test_hf_dataset.py # Test TinyImageNet
 ```
 
 ## Architecture Overview
 
-### Core Components
+### Core Flow-Matching
 
-1. **Flow Matching Model** (`train_flow.py`)
-   - Implements the flow-matching training objective where the model learns to predict velocities between noise and data
-   - Uses linear interpolation: `x_t = (1-t) * x_0 + t * x_1`
-   - Trains to match normalized velocity: `v_theta(x_t) <- (x_1 - x_0)`
+The model learns a velocity field v_θ(x_t) that transforms noise into data via:
+- **Interpolation**: x_t = (1-t) * x_0 + t * x_1
+- **Training objective**: v_θ(x_t) → (x_1 - x_0)
+- **Sampling**: Euler ODE solver from noise to data
 
-2. **Diffusion Transformer** (`diffusion_transformer.py`)
-   - DiT (Diffusion Transformer) backbone architecture
-   - Includes timestep embedding, class label embedding with dropout for classifier-free guidance
-   - Supports multiple model presets: debug, big, semilarge, large, xlarge
+### Model Components
 
-3. **VAE Integration** (`utils/stable_vae.py`)
-   - Optional Stable Diffusion VAE encoder/decoder for latent space diffusion
-   - Can train in either pixel space or VAE latent space
-
-4. **Training Infrastructure** (`utils/`)
-   - `train_state.py`: Training state management with Flax
-   - `checkpoint.py`: Model checkpointing
-   - `wandb.py`: Weights & Biases integration for experiment tracking
-   - `fid.py`: FID computation for model evaluation
-
-### Key Configuration Parameters
-
-- **Model Architecture**: `depth`, `hidden_size`, `patch_size`, `num_heads`, `mlp_ratio`
-- **Training**: `lr` (0.0001), `beta1` (0.9), `beta2` (0.99), `batch_size`
-- **Flow Matching**: `denoise_timesteps`, `t_sampler` (log-normal), `t_conditioning`
-- **Classifier-Free Guidance**: `class_dropout_prob` (0.1), `cfg_scale` (4.0)
-- **VAE**: `use_stable_vae` (0 or 1)
-
-### Dataset Support
-
-#### HuggingFace Datasets (Streaming)
-The codebase now supports HuggingFace datasets with streaming capabilities:
-- **CIFAR-10**: 10 classes, 32x32 images
-- **CIFAR-100**: 100 classes, 32x32 images  
-- **TinyImageNet**: 200 classes, 64x64 images (uses Maysee/tiny-imagenet)
-
-These datasets stream directly from HuggingFace Hub without requiring local storage.
-
-#### TensorFlow Datasets
-Original support for compiled TFDS datasets for `imagenet2012` or `celebahq`. These datasets need to be prepared using the tfds_builders repository mentioned in the README.
+1. **train_flow.py**: Main training loop with flow-matching loss
+2. **diffusion_transformer.py**: DiT backbone with AdaLN-Zero conditioning
+3. **utils/stable_vae.py**: Optional Stable Diffusion VAE encoder/decoder
+4. **utils/train_state.py**: Flax training state management
+5. **utils/dataset.py**: HuggingFace dataset streaming implementation
 
 ### Model Presets
 
-The code includes predefined model configurations:
-- **debug**: Minimal model for testing (hidden_size=64, depth=2)
-- **big**: DiT-B equivalent (hidden_size=768, depth=12)
-- **semilarge/large**: DiT-L variants (hidden_size=1024, depth=22-24)
-- **xlarge**: DiT-XL (hidden_size=1152, depth=28)
+- **debug**: hidden_size=64, depth=2 (testing only)
+- **big**: hidden_size=768, depth=12 (DiT-B equivalent, recommended)
+- **semilarge**: hidden_size=1024, depth=22
+- **large**: hidden_size=1024, depth=24 (DiT-L)
+- **xlarge**: hidden_size=1152, depth=28 (DiT-XL)
 
-### Sampling Process
+### Key Configuration Parameters
 
-During inference, the model solves an ODE using Euler sampling:
-```python
-x = noise
-for i in range(N):
-    dt = 1 / N
-    x = x + v_theta(x) * dt
-```
+- **Model**: `--model.preset`, `--model.patch_size` (2 for VAE, 8 for pixels)
+- **Training**: `--lr` (0.0001), `--batch_size`, `--max_steps`
+- **Flow**: `--denoise_timesteps`, `--t_sampler` (log-normal/uniform)
+- **CFG**: `--class_dropout_prob` (0.1), `--cfg_scale` (inference)
+- **VAE**: `--model.use_stable_vae` (0=pixel space, 1=latent space)
 
-The number of denoising steps can be dynamically adjusted (deterministic sampling).
+## Dataset Support
+
+### HuggingFace (Streaming, Recommended)
+- **cifar10**: 32x32, 10 classes
+- **cifar100**: 32x32, 100 classes  
+- **tiny-imagenet**: 64x64, 200 classes (uses Maysee/tiny-imagenet)
+
+### TensorFlow Datasets
+Requires manual compilation via [tfds_builders](https://github.com/kvfrans/tfds_builders):
+- **imagenet256**: 256x256 ImageNet
+- **celebahq256**: 256x256 CelebA-HQ
+
+## TPU/Multi-Device Training
+
+The codebase uses pmap for multi-device parallelization. Key considerations:
+- Batch size must be divisible by device count (8 for v3-8 TPU)
+- Use streaming datasets to avoid storage constraints
+- Model presets are memory-optimized for different configurations
+
+## Common Development Patterns
+
+### Adding New Datasets
+1. Check `utils/dataset.py` for HuggingFace dataset loading pattern
+2. Ensure dataset returns dict with 'image' and optionally 'label' keys
+3. Images should be normalized to [-1, 1] range
+
+### Modifying Model Architecture
+1. Edit `diffusion_transformer.py` for transformer changes
+2. Update model presets in `train_flow.py` config
+3. Ensure compatibility with AdaLN conditioning
+
+### Debugging Training
+1. Use `--model.preset debug` for quick iteration
+2. Set `--wandb.mode offline` to disable logging
+3. Add `--max_steps 100` for short test runs
+4. Check `test_*.py` files for component testing examples
+
+## Important Notes
+
+- Flow-matching uses deterministic sampling (no noise injection during inference)
+- Classifier-free guidance significantly improves sample quality (cfg_scale=4 recommended)
+- VAE latent space training (patch_size=2) is more efficient than pixel space (patch_size=8)
+- The codebase supports both v-prediction and normalized velocity parameterizations
